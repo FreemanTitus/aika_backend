@@ -1112,22 +1112,33 @@ async def get_vendor_coordinates_api(request, vendor_id: str):
     for a specific approved merchant storefront.
     """
     try:
-        # Include 'user__base_location' in select_related to prevent async lazy-loading exceptions
-        vendor = await MerchantProfile.objects.select_related('user', 'user__base_location').aget(id=vendor_id, is_approved=True)
+        vendor = await MerchantProfile.objects.select_related(
+            "user", "user__base_location"
+        ).aget(id=vendor_id, is_approved=True)
     except MerchantProfile.DoesNotExist:
         raise HttpError(404, "Vendor not found.")
 
-    lat = getattr(vendor, 'latitude', None) or getattr(vendor.user, 'latitude', None)
-    lng = getattr(vendor, 'longitude', None) or getattr(vendor.user, 'longitude', None)
-    
-    # Safely resolve base location name as a string
+    lat = getattr(vendor, "latitude", None)
+    if lat is None and vendor.user:
+        lat = getattr(vendor.user, "latitude", None)
+    if lat is None and vendor.user and vendor.user.base_location:
+        lat = vendor.user.base_location.latitude
+
+    lng = getattr(vendor, "longitude", None)
+    if lng is None and vendor.user:
+        lng = getattr(vendor.user, "longitude", None)
+    if lng is None and vendor.user and vendor.user.base_location:
+        lng = vendor.user.base_location.longitude
+
     base = ""
-    if hasattr(vendor, 'base_location') and vendor.base_location:
-        base = str(vendor.base_location)
+    if getattr(vendor, "base_location", None):
+        base = str(getattr(vendor.base_location, "name", vendor.base_location))
     elif vendor.user and vendor.user.base_location:
         base = str(vendor.user.base_location.name)
 
-    address = getattr(vendor, 'street_address', None) or getattr(vendor.user, 'street_address', None)
+    address = getattr(vendor, "street_address", None) or (
+        getattr(vendor.user, "street_address", None) if vendor.user else None
+    )
 
     return {
         "status": "success",
@@ -1137,8 +1148,8 @@ async def get_vendor_coordinates_api(request, vendor_id: str):
             "latitude": float(lat) if lat is not None else None,
             "longitude": float(lng) if lng is not None else None,
             "base_location": base,
-            "street_address": address
-        }
+            "street_address": address,
+        },
     }
 
 @router.post("/quote-delivery/{vendor_id}", auth=JWTAuth())

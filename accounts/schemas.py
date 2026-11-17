@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 from ninja import Schema
 from pydantic import BaseModel
 from pydantic import EmailStr, field_validator, model_validator
@@ -100,18 +100,34 @@ class RiderRegistrationInput(BaseRegistrationInput):
     first_name: str
     last_name: str
     bike_plate_number: str
-    device_type: str
-    
+    device_type: Literal['smartphone', 'feature_phone'] = 'smartphone'
+    base_location: Union[int, str]
+
     # Employment and Payout Configuration
     employment_type: Literal['full_time', 'casual'] = 'full_time'
     payout_schedule: Literal['daily', 'weekly', 'monthly'] = 'daily'
-    
+    payout_method: Literal['cash', 'account'] = 'account'
+
     # KYC and Security Fields for Bike Theft Protection
-    id_type: Optional[str] = None  # e.g., 'nin', 'drivers_license', 'voters_card'
+    id_type: Optional[Literal['nin', 'drivers_license', 'voters_card']] = None
     id_number: Optional[str] = None
+
+    # Guarantor KYC & Employment Verification
     guarantor_name: Optional[str] = None
     guarantor_phone: Optional[str] = None
+    guarantor_relationship: Optional[str] = None
     guarantor_address: Optional[str] = None
+    guarantor_employment_status: Optional[
+        Literal['employed', 'self_employed', 'civil_servant', 'retired', 'other']
+    ] = None
+    guarantor_occupation: Optional[str] = None
+    guarantor_workplace_address: Optional[str] = None
+    guarantor_passport_photograph: Optional[str] = None  # Base64 string if sent via JSON
+
+    @field_validator('bike_plate_number')
+    @classmethod
+    def normalize_plate(cls, v: str) -> str:
+        return v.strip().upper()
 
 
 class RegistrationResponse(Schema):
@@ -193,3 +209,5 @@ class LocationResponse(Schema):
     id: int
     name: str
     state_name: str
+    latitude: float | None = None
+    longitude: float | None = None

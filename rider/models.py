@@ -35,6 +35,13 @@ class RiderProfile(models.Model):
         BVN = 'drivers_license', 'Driver’s License'
         VOTERS_CARD = 'voters_card', 'Voter’s Card'
 
+    class GuarantorEmploymentStatus(models.TextChoices):
+        EMPLOYED = 'employed', 'Employed (Salaried)'
+        SELF_EMPLOYED = 'self_employed', 'Self-Employed / Business Owner'
+        CIVIL_SERVANT = 'civil_servant', 'Civil Servant / Government Worker'
+        RETIRED = 'retired', 'Retired'
+        OTHER = 'other', 'Other'
+
     id = models.CharField(primary_key=True, max_length=20, editable=False)
     user = models.OneToOneField(
         'accounts.CustomUser', 
@@ -70,10 +77,34 @@ class RiderProfile(models.Model):
     passport_photograph = models.ImageField(upload_to='riders/portraits/', blank=True, null=True)
     is_id_verified = models.BooleanField(default=False)
     
-    # Emergency / Guarantor details for bike security tracking
+    # Emergency / Guarantor KYC & Employment details for bike security tracking
     guarantor_name = models.CharField(max_length=255, blank=True, null=True)
     guarantor_phone = models.CharField(max_length=20, blank=True, null=True)
+    guarantor_relationship = models.CharField(max_length=100, blank=True, null=True)
     guarantor_address = models.TextField(blank=True, null=True)
+    guarantor_passport_photograph = models.ImageField(
+        upload_to='riders/guarantors/',
+        blank=True,
+        null=True,
+        help_text="Passport photograph of the rider's guarantor."
+    )
+    guarantor_employment_status = models.CharField(
+        max_length=30,
+        choices=GuarantorEmploymentStatus.choices,
+        blank=True,
+        null=True
+    )
+    guarantor_occupation = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text="Specific job title, trade, or business the guarantor engages in."
+    )
+    guarantor_workplace_address = models.TextField(
+        blank=True,
+        null=True,
+        help_text="Office, shop, or business address of the guarantor."
+    )
     
     bike_plate_number = models.CharField(max_length=20, unique=True)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.AVAILABLE)

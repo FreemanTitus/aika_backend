@@ -1,71 +1,139 @@
-from ninja import Router, Schema
+import math
+import logging
+from django.conf import settings
+from ninja import Router
 from ninja.errors import HttpError
 from django.db import transaction
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync, sync_to_async
-from accounts.models import CustomUser
+from accounts.models import CustomUser, CoverageArea
 from accounts.utils import JWTAuth
 from rider.models import RiderLocation, RiderProfile
 from .schemas import LocationUpdateSchema
 from order.models import Order as LogisticOrder
 from rider.schemas import RiderStatusSchema
 
+
+logger = logging.getLogger(__name__)
+
+
 router = Router(auth=JWTAuth())
+
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius_km = 6371.0
+    d_lat = math.radians(float(lat2) - float(lat1))
+    d_lon = math.radians(float(lon2) - float(lon1))
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(math.radians(float(lat1)))
+        * math.cos(math.radians(float(lat2)))
+        * math.sin(d_lon / 2) ** 2
+    )
+    a = max(0.0, min(1.0, a))
+    return 2 * radius_km * math.asin(math.sqrt(a))
 
 
 @router.post("/update-location")
 def update_rider_location(request, payload: LocationUpdateSchema):
     user = getattr(request, 'auth', None) or getattr(request, 'user', None)
-    
+
     if not user or not user.is_authenticated:
         raise HttpError(401, "Authentication credentials required.")
-    
+
     if getattr(user, 'role', None) != 'rider' and not getattr(user, 'is_staff', False):
         raise HttpError(403, "Access restricted to delivery riders.")
 
     try:
-        rider_profile = RiderProfile.objects.get(user=user)
+        rider_profile = RiderProfile.objects.select_related('user__base_location').get(user=user)
     except RiderProfile.DoesNotExist:
         raise HttpError(404, "Rider profile not found for this user account.")
 
-    # Perform updates outside heavy transactions to prevent sqlite lock congestion
-    loc, created = RiderLocation.objects.update_or_create(
+    base_location = getattr(rider_profile.user, 'base_location', None)
+    max_coverage_km = float(getattr(base_location, 'coverage_radius_km', 0) or 50.0)
+    within_coverage = True
+
+    if base_location:
+        hub_lat = getattr(base_location, 'latitude', None)
+        hub_lng = getattr(base_location, 'longitude', None)
+        if hub_lat is not None and hub_lng is not None and not getattr(settings, 'DEBUG', False):
+            distance_km = _haversine_km(hub_lat, hub_lng, payload.latitude, payload.longitude)
+            if distance_km > max_coverage_km:
+                within_coverage = False
+                logger.warning(
+                    "Rider %s blocked outside %s hub (%.1f km > %.1f km)",
+                    user.email,
+                    base_location.name,
+                    distance_km,
+                    max_coverage_km,
+                )
+                raise HttpError(
+                    403,
+                    f"Current GPS location is outside your assigned {base_location.name} coverage region ({distance_km:.1f} km away)."
+                )
+    else:
+        if hasattr(CoverageArea, 'latitude') and hasattr(CoverageArea, 'longitude'):
+            nearest_hub = None
+            nearest_dist = None
+            for hub in CoverageArea.objects.exclude(latitude__isnull=True, longitude__isnull=True):
+                dist = _haversine_km(hub.latitude, hub.longitude, payload.latitude, payload.longitude)
+                hub_radius = float(getattr(hub, 'coverage_radius_km', 0) or 50.0)
+                if dist <= hub_radius and (nearest_dist is None or dist < nearest_dist):
+                    nearest_hub = hub
+                    nearest_dist = dist
+
+            if nearest_hub:
+                base_location = nearest_hub
+                CustomUser.objects.filter(pk=user.pk).update(base_location=nearest_hub)
+            elif not getattr(settings, 'DEBUG', False):
+                raise HttpError(403, "No active regional delivery hub covers your current GPS location.")
+
+    loc, _ = RiderLocation.objects.update_or_create(
         rider=rider_profile,
         defaults={
             'latitude': payload.latitude,
-            'longitude': payload.longitude
+            'longitude': payload.longitude,
         }
     )
 
-    # Fast direct update on user model fields
     CustomUser.objects.filter(pk=user.pk).update(
-        latitude=payload.latitude, 
-        longitude=payload.longitude
+        latitude=payload.latitude,
+        longitude=payload.longitude,
     )
 
-    # Ensure rider status automatically becomes 'available' when active
-    if rider_profile.status == 'offline':
+    if rider_profile.status == 'offline' and within_coverage:
         rider_profile.status = 'available'
         rider_profile.save(update_fields=['status'])
 
-    # 4. Broadcast location live via WebSockets to admin desk
-    channel_layer = get_channel_layer()
-    async_to_sync(channel_layer.group_send)(
-        "admin_tracking_desk",
-        {
-            "type": "rider_location_broadcast",
-            "payload": {
-                "event": "rider_location_update",
-                "rider_id": rider_profile.id,
-                "rider_name": getattr(rider_profile, 'full_name', None) or user.email,
-                "latitude": payload.latitude,
-                "longitude": payload.longitude,
-                "updated_at": loc.updated_at.isoformat()
-            }
-        }
-    )
+    hub_id = base_location.id if base_location else None
+    hub_name = str(base_location.name) if base_location else None
 
-    return {"status": "success", "message": "Location updated successfully.", "rider_status": rider_profile.status}
+    channel_layer = get_channel_layer()
+    ws_message = {
+        "type": "rider_location_broadcast",
+        "payload": {
+            "event": "rider_location_update",
+            "rider_id": rider_profile.id,
+            "rider_name": getattr(rider_profile, 'full_name', None) or user.email,
+            "base_location_id": hub_id,
+            "base_location": hub_name,
+            "latitude": payload.latitude,
+            "longitude": payload.longitude,
+            "updated_at": loc.updated_at.isoformat(),
+        }
+    }
+    async_to_sync(channel_layer.group_send)("admin_tracking_desk", ws_message)
+    if hub_id:
+        async_to_sync(channel_layer.group_send)(f"admin_tracking_desk_{hub_id}", ws_message)
+
+    return {
+        "status": "success",
+        "message": "Location updated successfully.",
+        "rider_status": rider_profile.status,
+        "base_location_id": hub_id,
+        "base_location": hub_name,
+    }
 
 @router.post("/go-offline")
 def rider_go_offline(request):

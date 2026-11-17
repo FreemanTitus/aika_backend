@@ -1,14 +1,19 @@
 # accounts/api.py
 import json
+import base64
+import uuid
+import random
 import logging
 import threading
-from typing import List
+from typing import List, Optional
 from django.utils import timezone
 from django.http import JsonResponse
 from django.db import IntegrityError
 from ninja import Router
 from ninja.errors import HttpError
 from django.db import transaction
+from django.core.files.base import ContentFile
+from ninja import Form, File, UploadedFile
 from django.contrib.auth import get_user_model
 # Core models and updated Pydantic schemas
 from accounts.models import CustomUser, CoverageArea
@@ -51,6 +56,41 @@ DUMMY_PASSWORD = "DummyPassword123!"
 DUMMY_HASHED_PASSWORD = make_password(DUMMY_PASSWORD)
 
 
+def _regional_coordinates(coverage_area, add_local_offset: bool = True):
+    """
+    Returns (latitude, longitude) derived from the CoverageArea without modifying it.
+    Adds a subtle ~100m–400m jitter within the hub's region so users don't overlap on the exact same coordinate.
+    """
+    if not coverage_area or coverage_area.latitude is None or coverage_area.longitude is None:
+        return None, None
+
+    lat = Decimal(str(coverage_area.latitude))
+    lng = Decimal(str(coverage_area.longitude))
+
+    if add_local_offset:
+        # ~0.001 to ~0.0035 degrees is roughly 110m–380m inside the same town/hub
+        lat_offset = Decimal(str(round(random.uniform(-0.0035, 0.0035), 6)))
+        lng_offset = Decimal(str(round(random.uniform(-0.0035, 0.0035), 6)))
+        lat = (lat + lat_offset).quantize(Decimal("0.000001"))
+        lng = (lng + lng_offset).quantize(Decimal("0.000001"))
+
+    return lat, lng
+
+def _resolve_image_file(file_obj: Optional[UploadedFile], base64_or_str: Optional[str], prefix: str):
+    """
+    Accepts either a multipart UploadedFile or a base64 data URI string
+    and returns a Django-compatible File object (or None).
+    """
+    if file_obj is not None:
+        return file_obj
+
+    if isinstance(base64_or_str, str) and base64_or_str.startswith("data:image/"):
+        header, encoded = base64_or_str.split(";base64,", 1)
+        ext = header.split("/")[-1].split("+")[0] or "jpg"
+        return ContentFile(base64.b64decode(encoded), name=f"{prefix}_{uuid.uuid4().hex[:10]}.{ext}")
+
+    return None
+
 def authenticate_by_email(email, password):
     clean_email = email.strip().lower()
     try:
@@ -80,6 +120,13 @@ def validate_registration_password(data) -> str:
 # =========================================================================
 
 def db_register_individual(data, hashed_password):
+    coverage_area = CoverageArea.objects.filter(id=data.base_location).first()
+    if not coverage_area:
+        raise HttpError(400, "The selected base location is invalid or no longer exists.")
+
+    # Use add_local_offset=False if you want exact hub coordinates (e.g., 8.910800, 8.406600)
+    user_lat, user_lng = _regional_coordinates(coverage_area, add_local_offset=True)
+
     with transaction.atomic():
         user = User.objects.create(
             email=data.email.strip().lower(),
@@ -90,6 +137,8 @@ def db_register_individual(data, hashed_password):
             phone_number=data.phone_number,
             base_location_id=data.base_location,
             street_address=data.street_address,
+            latitude=user_lat,
+            longitude=user_lng,
             is_terms_accepted=True,
             terms_accepted_at=timezone.now()
         )
@@ -129,6 +178,13 @@ def db_register_individual(data, hashed_password):
 
 
 def db_register_business(data, hashed_password):
+    coverage_area = CoverageArea.objects.filter(id=data.base_location).first()
+    if not coverage_area:
+        raise HttpError(400, "The selected base location is invalid or no longer exists.")
+
+    # Use add_local_offset=False if you want exact hub coordinates (e.g., 8.910800, 8.406600)
+    user_lat, user_lng = _regional_coordinates(coverage_area, add_local_offset=True)
+    
     with transaction.atomic():
         user = User.objects.create(
             email=data.email.strip().lower(),
@@ -138,6 +194,8 @@ def db_register_business(data, hashed_password):
             phone_number=data.phone_number,
             street_address=data.street_address or "Vendor Depot",
             base_location_id=data.base_location,
+            latitude=user_lat,
+            longitude=user_lng,
             is_terms_accepted=True,
             terms_accepted_at=timezone.now(),
         )
@@ -149,40 +207,86 @@ def db_register_business(data, hashed_password):
         )
         return user.id, profile.id
 
-def db_register_rider(data, hashed_password):
+def db_register_rider(
+    data,
+    hashed_password,
+    guarantor_passport_file: Optional[UploadedFile] = None,
+    rider_passport_file: Optional[UploadedFile] = None,
+    id_document_file: Optional[UploadedFile] = None,
+):
+    # Support both CoverageArea integer ID and string hub name
+    if isinstance(data.base_location, int) or str(data.base_location).isdigit():
+        coverage_area = CoverageArea.objects.filter(id=int(data.base_location)).first()
+    else:
+        coverage_area = CoverageArea.objects.filter(
+            name__iexact=str(data.base_location).strip()
+        ).first()
+
+    if not coverage_area:
+        raise HttpError(400, "The selected base location is invalid or no longer exists.")
+
+    # Use add_local_offset=False if you want exact hub coordinates (e.g., 8.910800, 8.406600)
+    user_lat, user_lng = _regional_coordinates(coverage_area, add_local_offset=True)
+
+    guarantor_passport = _resolve_image_file(
+        guarantor_passport_file,
+        getattr(data, 'guarantor_passport_photograph', None),
+        "guarantor_passport",
+    )
+    rider_passport = _resolve_image_file(
+        rider_passport_file,
+        getattr(data, 'passport_photograph', None),
+        "rider_passport",
+    )
+    id_document = _resolve_image_file(
+        id_document_file,
+        getattr(data, 'id_document_image', None),
+        "rider_id",
+    )
+
     with transaction.atomic():
         user = User.objects.create(
             email=data.email.strip().lower(),
-            first_name=data.first_name,
-            last_name=data.last_name,
+            first_name=data.first_name.strip(),
+            last_name=data.last_name.strip(),
             role=User.Role.RIDER,
             password=hashed_password,
-            phone_number=data.phone_number,
-            base_location_id=data.base_location,
-            street_address=data.street_address,
+            phone_number=data.phone_number.strip(),
+            base_location_id=coverage_area.id,
+            street_address=data.street_address.strip(),
+            latitude=user_lat,
+            longitude=user_lng,
             is_terms_accepted=True,
-            terms_accepted_at=timezone.now()
+            terms_accepted_at=timezone.now(),
         )
-        
+
         rider = RiderProfile.objects.create(
             user=user,
-            first_name=data.first_name,
-            last_name=data.last_name,
-            bike_plate_number=data.bike_plate_number,
+            first_name=data.first_name.strip(),
+            last_name=data.last_name.strip(),
+            bike_plate_number=data.bike_plate_number.strip().upper(),
             device_type=data.device_type,
             employment_type=getattr(data, 'employment_type', 'full_time'),
             payout_schedule=getattr(data, 'payout_schedule', 'daily'),
+            payout_method=getattr(data, 'payout_method', 'account'),
             id_type=getattr(data, 'id_type', None),
             id_number=getattr(data, 'id_number', None),
+            id_document_image=id_document,
+            passport_photograph=rider_passport,
             guarantor_name=getattr(data, 'guarantor_name', None),
             guarantor_phone=getattr(data, 'guarantor_phone', None),
+            guarantor_relationship=getattr(data, 'guarantor_relationship', None),
             guarantor_address=getattr(data, 'guarantor_address', None),
+            guarantor_employment_status=getattr(data, 'guarantor_employment_status', None),
+            guarantor_occupation=getattr(data, 'guarantor_occupation', None),
+            guarantor_workplace_address=getattr(data, 'guarantor_workplace_address', None),
+            guarantor_passport_photograph=guarantor_passport,
             is_vetted=False,
-            is_id_verified=False  
+            is_id_verified=False,
         )
-        
-        return user.id, rider.id
 
+        return user.id, rider.id
+    
 def execute_rider_registration(service, data) -> dict:
     hashed_password = validate_registration_password(data)
 
@@ -284,8 +388,23 @@ def register_individual_api(request, data: IndividualRegistrationInput):
     return 201, response_data
 
 @router.post("/register/rider", response={201: RegistrationResponse})
-def register_rider_api(request, data: RiderRegistrationInput):
-    response_data = execute_rider_registration(db_register_rider, data)
+def register_rider_api(
+    request,
+    data: Form[RiderRegistrationInput],
+    guarantor_passport_photograph: Optional[UploadedFile] = File(None),
+    passport_photograph: Optional[UploadedFile] = File(None),
+    id_document_image: Optional[UploadedFile] = File(None),
+):
+    response_data = execute_rider_registration(
+        lambda d, pwd: db_register_rider(
+            d,
+            pwd,
+            guarantor_passport_file=guarantor_passport_photograph,
+            rider_passport_file=passport_photograph,
+            id_document_file=id_document_image,
+        ),
+        data,
+    )
     response_data['message'] = "Welcome to Aika"
     send_rider_welcome_email(data.email, data.first_name)
     return 201, response_data
@@ -521,7 +640,9 @@ def get_active_locations(request):
         {
             "id": area.id, 
             "name": area.name, 
-            "state_name": area.state.name
+            "state_name": area.state.name,
+            "latitude": float(area.latitude) if area.latitude is not None else None,
+            "longitude": float(area.longitude) if area.longitude is not None else None,
         }
         for area in areas
     ]

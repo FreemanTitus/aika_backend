@@ -1,7 +1,7 @@
 from ninja import Schema
 from pydantic import Field, field_validator
 from decimal import Decimal
-from typing import Optional, List
+from typing import Optional, List, Union
 from datetime import datetime
 
 
@@ -36,8 +36,18 @@ class CoordinateUpdatePayload(Schema):
     """
     latitude: Optional[Decimal] = None
     longitude: Optional[Decimal] = None
-    base_location: Optional[str] = None
+    base_location: Optional[Union[int, str]] = None
     street_address: Optional[str] = None
+
+    @field_validator('base_location')
+    @classmethod
+    def normalize_base_location(cls, v: Optional[Union[int, str]]) -> Optional[Union[int, str]]:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            stripped = v.strip()
+            return stripped if stripped else None
+        return v
 
     @field_validator('latitude')
     @classmethod

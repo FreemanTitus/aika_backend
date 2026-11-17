@@ -3,20 +3,19 @@ import logging
 import httpx
 from django.conf import settings
 from ninja import Router
+from django.core.exceptions import FieldDoesNotExist
 from ninja.errors import HttpError
 from django.db import transaction
 from asgiref.sync import sync_to_async
-from .models import RiderProfile, RiderPaymentAccount
+from .models import RiderProfile, RiderPaymentAccount, RiderWallet
 from marketplace.models import MarketplaceOrder
 from .schemas import RiderDashboardResponse, RiderStatusSchema, ActiveOrdersListSchema, RiderPreferencesSchema
 from order.models import Order
 from accounts.utils import JWTAuth
 from marketing.models import UserNotification
-from django.db.models import Sum
 from channels.layers import get_channel_layer
 from wallet.utils import process_order_revenue_split
-from core.models import DeliveryConfig
-from django.db.models import Count, Sum
+from django.db.models import Count, Sum, Q
 from decimal import Decimal
 
 
@@ -24,32 +23,42 @@ logger = logging.getLogger(__name__)
 
 router = Router(tags=["Riders"], auth=JWTAuth())
 
+def _has_model_field(model, field_name: str) -> bool:
+    try:
+        model._meta.get_field(field_name)
+        return True
+    except FieldDoesNotExist:
+        return False
+    
+
 def get_rider_wallet_stats(rider):
     """
-    Computes financial statistics for a rider based on dynamically 
-    captured order earnings and the 'delivered' status.
+    Computes financial statistics for a rider, pulling the actual spendable 
+    balance directly from the persistent RiderWallet model.
     """
-    # Filter for successfully delivered orders assigned to this rider
+    # 1. Fetch or get the actual persistent wallet record
+    wallet, _ = RiderWallet.objects.get_or_create(rider=rider, defaults={'balance': Decimal('0.00'), 'total_earned': Decimal('0.00')})
+
+    # 2. Filter for successfully delivered or completed orders assigned to this rider for counts/commissions
     delivered_orders = Order.objects.filter(
         assigned_rider=rider, 
-        status=Order.OrderStatus.DELIVERED
+        status__in=[Order.OrderStatus.DELIVERED, Order.OrderStatus.COMPLETED]
     )
 
-    # Aggregate metrics efficiently at the database level
     stats = delivered_orders.aggregate(
         total_deliveries=Count('id'),
-        rider_total_earnings=Sum('rider_earning'),
         platform_commission_total=Sum('platform_fee')
     )
 
-    # Handle null values (if the rider has 0 deliveries yet)
     total_deliveries = stats['total_deliveries'] or 0
-    rider_earnings = stats['rider_total_earnings'] or Decimal('0.00')
     platform_commission = stats['platform_commission_total'] or Decimal('0.00')
-    gross_volume = rider_earnings + platform_commission
+    
+    # Use wallet.balance and wallet.total_earned from the database table
+    rider_balance = wallet.balance
+    gross_volume = rider_balance + platform_commission
 
     return {
-        "wallet_balance": float(rider_earnings),
+        "wallet_balance": float(rider_balance),
         "total_deliveries": total_deliveries,
         "platform_commission_withheld": float(platform_commission),
         "gross_delivery_volume": float(gross_volume)
@@ -68,6 +77,8 @@ def get_rider_dashboard(request):
         raise HttpError(403, 'Forbidden: Rider profile not found')
     
     wallet_stats = get_rider_wallet_stats(rider)
+
+    print("Wallet Stats", wallet_stats)
 
     # Standard synchronous database query & evaluation
     active_deliveries = list(
@@ -133,23 +144,59 @@ async def update_rider_status(request, data: RiderStatusSchema):
 
     return {"status": "success", "new_status": rider.status}
 
+
 @router.get("/available-orders", response={200: ActiveOrdersListSchema})
 def get_available_orders(request):
     # 1. Guardrail
     if request.user.role != 'rider':
         raise HttpError(403, "Access restricted.")
 
-    # 2. Pre-fetch the related marketplace_order to avoid N+1 queries 
-    # and the SynchronousOnlyOperation error.
-    queryset = Order.objects.select_related('marketplace_order').filter(
-        status=Order.OrderStatus.ACKNOWLEDGED
-    ).order_by('-created_at')
+    # 2. Resolve the rider's assigned regional hub
+    rider_location = getattr(request.user, 'base_location', None)
+    rider_location_id = getattr(request.user, 'base_location_id', None)
+
+    if not rider_location_id:
+        return 200, {"status": "success", "active_orders": []}
+
+    rider_hub_name = str(rider_location.name).strip() if rider_location else ""
+
+    # 3. Restrict orders strictly to the rider's regional hub
+    region_filter = Q(marketplace_order__vendor__user__base_location_id=rider_location_id)
+
+    # Direct logistics orders: check whether sender points to CustomUser or a Profile with .user
+    sender_field = Order._meta.get_field('sender')
+    sender_model = sender_field.related_model
+    if _has_model_field(sender_model, 'base_location'):
+        region_filter |= Q(marketplace_order__isnull=True, sender__base_location_id=rider_location_id)
+    elif _has_model_field(sender_model, 'user'):
+        region_filter |= Q(marketplace_order__isnull=True, sender__user__base_location_id=rider_location_id)
+
+    if _has_model_field(Order, 'base_location'):
+        region_filter |= Q(base_location_id=rider_location_id)
+    elif rider_hub_name:
+        region_filter |= Q(
+            marketplace_order__isnull=True,
+            pickup_address__icontains=rider_hub_name
+        )
+
+    queryset = (
+        Order.objects.select_related(
+            'marketplace_order',
+            'marketplace_order__vendor__user__base_location',
+            'sender'
+        )
+        .filter(
+            status=Order.OrderStatus.ACKNOWLEDGED,
+            assigned_rider__isnull=True
+        )
+        .filter(region_filter)
+        .distinct()
+        .order_by('-created_at')
+    )
 
     orders_list = []
-    
-    # 3. Iterate through the queryset
+
     for order in queryset:
-        # Use a safe check to get the ID, handling the case where it might be null
         m_id = order.marketplace_order_id if order.marketplace_order_id else "N/A"
 
         orders_list.append({

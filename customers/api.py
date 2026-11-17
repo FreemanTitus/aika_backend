@@ -1,4 +1,5 @@
 import json
+import math
 import logging
 from django.shortcuts import get_object_or_404
 from django.http import JsonResponse
@@ -28,7 +29,7 @@ from booking.models import RideBooking, SendPackage
 from marketplace.models import MarketplaceOrder
 from audit.models import SystemAuditLog, OrderDisputeRefund
 from audit.schemas import CustomerDisputeCreateSchema, CustomerDisputeOut
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from django.utils.html import escape
 from order.services import complete_marketplace_order
 from wallet.utils import PAID_ORDER_STATES
@@ -45,11 +46,24 @@ router = Router(
     auth=JWTAuth()
 )
 
+def _quantize_coord(value) -> Decimal:
+    """Safely normalize any float/str/Decimal GPS coordinate to 6 decimal places."""
+    return Decimal(str(value)).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculate distance in kilometers between two GPS coordinates."""
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
 @router.get("/dashboard")
 async def individual_dashboard(request):
     """
     Asynchronously retrieves the individual dashboard including 
-    active ride bookings, package deliveries, historical marketplace orders, and wallet/referral metrics.
+    active ride bookings, package deliveries, active marketplace orders, and wallet/referral metrics.
     """
     user = request.user
 
@@ -100,15 +114,18 @@ async def individual_dashboard(request):
         reverse=True
     )
 
-    # 5. Fetch Completed Marketplace Orders with Rider Details
+    # 5. Fetch Active/Dispatched Marketplace Orders (excluding completed history)
     orders_qs = MarketplaceOrder.objects.filter(
         customer=individual
+    ).exclude(
+        status='completed'
     ).select_related(
+        'vendor', 
         'logistics_dispatch',
         'logistics_dispatch__assigned_rider'
-    ).order_by('-created_at')[:5]
+    ).order_by('-created_at')[:20]
 
-    completed_orders = []
+    active_orders = []
     for order in await sync_to_async(list)(orders_qs):
         rider_data = None
         dispatch = getattr(order, 'logistics_dispatch', None)
@@ -120,7 +137,7 @@ async def individual_dashboard(request):
                 "bike_plate_number": rider.bike_plate_number
             }
 
-        completed_orders.append({
+        active_orders.append({
             "id": order.id,
             "total_price": str(order.total_price),
             "status": order.status,
@@ -141,13 +158,14 @@ async def individual_dashboard(request):
                 "referral_code": individual.referral_code,
                 "total_referrals": total_referrals,
                 "successful_rewards": successful_rewards,
-                "earned_bonus": float(wallet.balance) # or track bonus ledger sum
+                "earned_bonus": float(wallet.balance)
             },
             "active_bookings": active_bookings,
-            "order_history": completed_orders
+            "order_history": active_orders # Keeps processing & active delivery confirmation items only
         }
     }
 
+    
 @router.get("/profile", response=UserProfileOut)
 def get_customer_profile(request):
     """
@@ -345,8 +363,8 @@ def list_customer_bookings(request):
 @router.post("/profile/update-coordinates")
 def update_user_coordinates_api(request, data: CoordinateUpdatePayload):
     """
-    Synchronously links real-time device coordinate geometries 
-    and address metadata to the customer's IndividualProfile.
+    Synchronously links real-time device coordinate geometries
+    and address metadata to the customer's user record and IndividualProfile.
     """
     user = request.user
 
@@ -357,51 +375,90 @@ def update_user_coordinates_api(request, data: CoordinateUpdatePayload):
         profile, _ = IndividualProfile.objects.get_or_create(
             user=user,
             defaults={
-                'first_name': user.first_name or 'Customer',
-                'last_name': user.last_name or 'User'
-            }
+                "first_name": user.first_name or "Customer",
+                "last_name": user.last_name or "User",
+            },
         )
-        
+
         update_fields = []
 
         if data.street_address is not None:
-            profile.default_delivery_address = data.street_address
-            profile.save(update_fields=['default_delivery_address'])
-            user.street_address = data.street_address
-            update_fields.append('street_address')
+            clean_address = data.street_address.strip()
+            profile.default_delivery_address = clean_address
+            profile.save(update_fields=["default_delivery_address"])
+            user.street_address = clean_address
+            update_fields.append("street_address")
 
+        # Safely resolve CoverageArea whether payload sends an int ID or string name
+        target_coverage = user.base_location
         if data.base_location is not None:
-            user.base_location = data.base_location
-            update_fields.append('base_location')
+            if isinstance(data.base_location, int) or str(data.base_location).isdigit():
+                target_coverage = CoverageArea.objects.filter(id=int(data.base_location)).first()
+            else:
+                target_coverage = CoverageArea.objects.filter(
+                    name__iexact=str(data.base_location).strip()
+                ).first()
+
+            if not target_coverage:
+                raise HttpError(400, f"Invalid base location: '{data.base_location}'.")
+
+            user.base_location = target_coverage
+            update_fields.append("base_location")
 
         if data.latitude is not None and data.longitude is not None:
-            user.latitude = data.latitude
-            user.longitude = data.longitude
-            update_fields.extend(['latitude', 'longitude'])
+            lat_val = float(data.latitude)
+            lng_val = float(data.longitude)
+
+            if not (-90.0 <= lat_val <= 90.0 and -180.0 <= lng_val <= 180.0):
+                raise HttpError(400, "Invalid GPS coordinates provided.")
+
+            # Guard against emulator/VPN defaults (0,0) or coordinates far outside the hub region (> 50km)
+            if (
+                target_coverage
+                and target_coverage.latitude is not None
+                and target_coverage.longitude is not None
+            ):
+                dist_km = _haversine_km(
+                    float(target_coverage.latitude),
+                    float(target_coverage.longitude),
+                    lat_val,
+                    lng_val,
+                )
+                if dist_km > 50.0:
+                    raise HttpError(
+                        400,
+                        f"Your device GPS ({lat_val:.4f}, {lng_val:.4f}) is outside your selected hub ({target_coverage.name}).",
+                    )
+
+            user.latitude = _quantize_coord(lat_val)
+            user.longitude = _quantize_coord(lng_val)
+            update_fields.extend(["latitude", "longitude"])
 
         if update_fields:
             user.save(update_fields=update_fields)
-        
+
         return {
             "status": "success",
             "message": "Geospatial metrics synchronized successfully.",
             "data": {
-                "latitude": float(data.latitude) if data.latitude is not None else None,
-                "longitude": float(data.longitude) if data.longitude is not None else None,
-                "base_location": data.base_location,
-                "street_address": data.street_address
-            }
+                "latitude": float(user.latitude) if user.latitude is not None else None,
+                "longitude": float(user.longitude) if user.longitude is not None else None,
+                "base_location": user.base_location.name if user.base_location else "",
+                "street_address": user.street_address,
+            },
         }
-        
+
+    except HttpError:
+        raise
     except Exception as e:
-        if isinstance(e, HttpError):
-            raise e
+        logger.exception("Failed updating coordinates for user %s", user.id)
         raise HttpError(500, f"An unhandled database mutation fault occurred: {str(e)}")
+
 
 @router.get("/coordinates")
 def get_customer_coordinates_api(request):
     """
-    Retrieves the real-time device coordinate geometries 
+    Retrieves the real-time device coordinate geometries
     and address metadata for the authenticated customer synchronously.
     """
     user = request.user
@@ -409,33 +466,25 @@ def get_customer_coordinates_api(request):
     if not user or user.is_anonymous:
         raise HttpError(401, "Authentication credentials missing or invalid.")
 
-    try:
-        profile = IndividualProfile.objects.select_related('user', 'user__base_location').get(user=user)
-    except IndividualProfile.DoesNotExist:
-        profile = None
+    profile = (
+        IndividualProfile.objects.select_related("user", "user__base_location")
+        .filter(user=user)
+        .first()
+    )
 
-    # Resolve latitude and longitude with fallbacks
-    lat = getattr(profile, 'latitude', None) if profile else None
-    if lat is None:
-        lat = getattr(user, 'latitude', None)
+    # Prefer live user coordinates, falling back to profile or hub coordinates
+    lat = user.latitude if user.latitude is not None else getattr(profile, "latitude", None)
+    lng = user.longitude if user.longitude is not None else getattr(profile, "longitude", None)
 
-    lng = getattr(profile, 'longitude', None) if profile else None
-    if lng is None:
-        lng = getattr(user, 'longitude', None)
+    if (lat is None or lng is None) and user.base_location:
+        lat = user.base_location.latitude
+        lng = user.base_location.longitude
 
-    # Resolve base location name synchronously
-    base_location_name = ""
-    if profile and hasattr(profile, 'base_location') and profile.base_location:
-        base_location_name = str(getattr(profile.base_location, 'name', profile.base_location))
-    elif user and hasattr(user, 'base_location') and user.base_location:
-        base_location_name = str(getattr(user.base_location, 'name', user.base_location))
-
-    # Resolve street address with fallbacks
-    street_addr = None
-    if profile:
-        street_addr = getattr(profile, 'default_delivery_address', None)
-    if not street_addr:
-        street_addr = getattr(user, 'street_address', None)
+    base_location_name = user.base_location.name if user.base_location else ""
+    street_addr = (
+        (profile.default_delivery_address if profile and profile.default_delivery_address else None)
+        or user.street_address
+    )
 
     return {
         "status": "success",
@@ -443,8 +492,8 @@ def get_customer_coordinates_api(request):
             "latitude": float(lat) if lat is not None else None,
             "longitude": float(lng) if lng is not None else None,
             "base_location": base_location_name,
-            "street_address": street_addr
-        }
+            "street_address": street_addr,
+        },
     }
 
 @router.post("/orders/{marketplace_id}/complete", response={200: dict})

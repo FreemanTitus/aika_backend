@@ -205,7 +205,7 @@ def process_order_revenue_split(marketplace_order, force=False, include_delivery
                 total_basket_value=basket_value,
                 platform_fee_collected=platform_fee_collected,
                 vendor_payout_share=vendor_share,
-                paystack_reference=order.payment_reference or f"PSK-REF-{order.id}",
+                paystack_reference=order.payment_reference or f"REF{order.id}",
             ),
         )
 

@@ -110,6 +110,9 @@ def complete_marketplace_order(marketplace_id, actor_user, *, allow_vendor=False
         except MarketplaceOrder.DoesNotExist:
             raise LookupError("Order not found.")
 
+        if m_order.status in ['completed', 'delivered']:
+            raise ValueError("This order has already been completed and confirmed.")
+
         is_self_delivery = m_order.fulfillment_mode == MarketplaceOrder.FulfillmentMode.VENDOR_SELF_DELIVERY
 
         if not system:
@@ -187,7 +190,7 @@ def complete_marketplace_order(marketplace_id, actor_user, *, allow_vendor=False
 
             # Free the rider for the next job (checking status or availability flag as appropriate for your schema)
             RiderProfile.objects.filter(pk=rider.pk).update(
-                is_active_for_delivery=True
+                status='available'
             )
 
         return m_order, logistics_order, rider_new_balance, rider_user_id
