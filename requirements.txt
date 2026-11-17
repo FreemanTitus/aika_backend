@@ -1,0 +1,18 @@
+django
+channels[daphne]
+channels-redis
+redis
+pillow
+django-cors-headers
+django-ninja
+django-webpush
+python-decouple
+PyJWT
+httpx
+requests
+psycopg2-binary
+weasyprint
+geopy
+
+# Local development only (enabled automatically when DEBUG=True; never install in production)
+# django-silk

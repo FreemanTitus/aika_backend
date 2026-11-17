@@ -1,0 +1,119 @@
+{% load humanize %}<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Receipt {{ order.id }}</title>
+    <style>
+        /* Self-contained: no remote fonts or stylesheets (the PDF renderer blocks all network access). */
+        @page { size: A4; margin: 18mm; }
+
+        body {
+            font-family: 'Courier New', Courier, monospace;
+            padding: 0;
+            color: #0A1128;
+            font-size: 13px;
+        }
+
+        .header {
+            text-align: center;
+            border-bottom: 2px dashed #333;
+            padding-bottom: 20px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .header h1 { margin: 0 0 6px 0; font-size: 22px; }
+        .header p { margin: 2px 0; }
+        .meta { margin-top: 15px; font-size: 13px; color: #555; text-transform: none; letter-spacing: 0; }
+
+        .table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+
+        .table th {
+            border-bottom: 1px solid #333;
+            text-transform: uppercase;
+            font-size: 11px;
+            text-align: left;
+            padding-bottom: 6px;
+        }
+
+        .table td { padding: 8px 0; border-bottom: 1px dotted #ccc; text-align: left; vertical-align: top; }
+        .table .num { text-align: right; white-space: nowrap; }
+
+        .summary { width: 100%; margin-top: 18px; border-collapse: collapse; }
+        .summary td { padding: 3px 0; }
+        .summary .label { text-align: right; padding-right: 14px; color: #555; }
+        .summary .value { text-align: right; width: 140px; white-space: nowrap; }
+
+        .total {
+            font-size: 18px;
+            font-weight: bold;
+            margin-top: 22px;
+            text-align: right;
+            border-top: 2px solid #333;
+            padding-top: 10px;
+        }
+
+        .footer { margin-top: 28px; text-align: center; font-size: 11px; color: #777; }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <h1>Transaction Receipt</h1>
+    <p>Order ID: {{ order.id }}</p>
+    <p>{{ order.created_at|date:"d M Y, H:i" }}</p>
+
+    <div class="meta">
+        <strong>From:</strong> {{ order.vendor.company_name }}<br>
+        <strong>Support:</strong> {{ order.vendor.user.phone_number }}<br>
+        <strong>Status:</strong> {{ order.get_status_display }}
+        {% if order.payment_reference %}<br><strong>Payment ref:</strong> {{ order.payment_reference }}{% endif %}
+    </div>
+</div>
+
+<table class="table">
+    <thead>
+        <tr>
+            <th>Item</th>
+            <th class="num">Qty</th>
+            <th class="num">Unit price</th>
+            <th class="num">Line total</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for item in order.items.all %}
+        <tr>
+            <td>{{ item.get_product_name }}</td>
+            <td class="num">{{ item.quantity }}</td>
+            <td class="num">₦{{ item.price_at_order|intcomma }}</td>
+            <td class="num">₦{{ item.get_total_item_price|intcomma }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+
+<table class="summary">
+    <tr>
+        <td class="label">Subtotal</td>
+        <td class="value">₦{{ order.subtotal|intcomma }}</td>
+    </tr>
+    <tr>
+        <td class="label">Delivery fee</td>
+        <td class="value">₦{{ order.delivery_fee|add:order.wallet_applied|intcomma }}</td>
+    </tr>
+    {% if order.wallet_applied %}
+    <tr>
+        <td class="label">Wallet credit applied</td>
+        <td class="value">-₦{{ order.wallet_applied|intcomma }}</td>
+    </tr>
+    {% endif %}
+</table>
+
+<div class="total">
+    TOTAL PAID: ₦{{ order.total_price|intcomma }}
+</div>
+
+<div class="footer">Thank you for shopping with Aika.</div>
+
+</body>
+</html>
