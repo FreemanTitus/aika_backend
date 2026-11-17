@@ -1088,7 +1088,7 @@ def mark_rider_payout_completed(request, rider_id: str):
     """
     Marks a rider's accumulated balance as settled/paid out.
     """
-    i_require_admin(request.auth)
+    _require_admin(request.auth)
     
     try:
         rider = RiderProfile.objects.get(id=rider_id)
@@ -1311,6 +1311,8 @@ def admin_list_subscribers(request):
 def admin_broadcast_newsletter(request, payload: NewsletterBroadcastSchema):
     _require_admin(request.auth)
 
+    user = request.auth
+
     try:
         sent_count, total_recipients = send_newsletter(payload.subject, payload.content, payload.template_type)
     except ValueError as e:
@@ -1331,6 +1333,8 @@ def admin_broadcast_newsletter(request, payload: NewsletterBroadcastSchema):
 @router.post("/broadcasts/send", response={200: dict}, auth=JWTAuth())
 def send_system_broadcast(request, payload: BroadcastCreateSchema):
     _require_admin(request.auth)
+
+    user = request.auth
 
     if payload.target_audience not in ('all', 'vendors', 'merchants', 'riders', 'customers'):
         raise HttpError(400, "Invalid target audience.")
