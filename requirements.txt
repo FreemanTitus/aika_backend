@@ -1,18 +1,16 @@
-django
-channels[daphne]
-channels-redis
-redis
-pillow
-django-cors-headers
-django-ninja
-django-webpush
-python-decouple
-PyJWT
-httpx
-requests
-psycopg2-binary
-weasyprint
-geopy
-
-# Local development only (enabled automatically when DEBUG=True; never install in production)
-# django-silk
+django==6.1.1
+channels==4.3.2
+channels-redis==4.3.0
+redis==8.1.0
+pillow==12.3.0
+django-cors-headers==4.9.0
+django-ninja==1.7.0
+django-webpush==0.3.6
+python-decouple==3.8
+PyJWT==2.15.1
+httpx==0.28.1
+requests==2.34.2
+psycopg2-binary==2.9.12
+weasyprint==69.0
+geopy==2.5.0
+uvicorn==0.54.0
