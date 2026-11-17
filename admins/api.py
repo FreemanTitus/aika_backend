@@ -85,6 +85,8 @@ def admin_dashboard_api(request):
     Core administrative command center endpoint. Restricts access to superusers/staff
     and returns JSON data for the frontend dashboard matrix.
     """
+    _require_admin(request.auth)
+
     pending_dispatches = Order.objects.filter(
         status='acknowledged', assigned_rider__isnull=True
     ).select_related('sender', 'marketplace_source').order_by('-updated_at')
@@ -111,6 +113,8 @@ def admin_dashboard_stats_api(request):
     Returns aggregated platform-wide statistics and dynamic time-series chart trends for the admin dashboard.
     Restricted strictly to superusers or management staff.
     """
+    _require_admin(request.auth)
+    
     total_orders = Order.objects.count()
     total_merchants = MerchantProfile.objects.count()
     total_riders = RiderProfile.objects.count()
@@ -242,12 +246,10 @@ def admin_vendors_view(request, type: Optional[str] = Query(default=None)):
     """
     Management dashboard workspace to audit, approve, and oversee corporate business entities.
     """
-    user = request.auth  
-    if not user and hasattr(request, 'user'):
-        user = request.user
 
-    if not user or not user.is_authenticated or (user.role not in [CustomUser.Role.ADMIN, CustomUser.Role.STAFF] and not user.is_superuser):
-        raise HttpError(403, "Access unauthorized. Management credentials required.")
+    _require_admin(request.auth)
+
+    user = request.auth  
 
     vendor_qs = MerchantProfile.objects.filter(business_type__isnull=False)
 
@@ -277,11 +279,7 @@ def get_single_vendor_detail(request, vendor_id: str):
     Retrieve individual vendor profile details along with active staff agents pool for auditing.
     """
     user = request.auth
-    if not user and hasattr(request, 'user'):
-        user = request.user
-
-    if not user or not user.is_authenticated or (user.role not in [CustomUser.Role.ADMIN, CustomUser.Role.STAFF] and not user.is_superuser):
-        return 403, {"detail": "Access unauthorized. Management credentials required."}
+    _require_admin(request.auth)
 
     try:
         vendor = MerchantProfile.objects.select_related('user', 'assigned_agent').get(id=vendor_id)
@@ -303,6 +301,8 @@ def admin_list_vendor_products(request, vendor_id: str):
     """
     Queries all catalog profiles owned by a specific vendor.
     """
+    _require_admin(request.auth)
+
     user = request.auth or request.user
     if not user.is_authenticated:
         raise HttpError(401, "Authentication credentials required.")
@@ -374,6 +374,8 @@ def admin_update_vendor_product_api(
     """
     Processes updates for a product belonging to a vendor.
     """
+    _require_admin(request.auth)
+
     user = request.auth or request.user
     if not user.is_authenticated:
         raise HttpError(401, "Authentication credentials required.")
@@ -431,12 +433,11 @@ def update_vendor_assignment(request, vendor_id: str, payload: AssignAgentSchema
     """
     Update or clear the assigned support agent for a given vendor entity.
     """
+    _require_admin(request.auth)
+
     user = request.auth
     if not user and hasattr(request, 'user'):
         user = request.user
-
-    if not user or not user.is_authenticated or (user.role not in [CustomUser.Role.ADMIN, CustomUser.Role.STAFF] and not user.is_superuser):
-        return 403, {"detail": "Access unauthorized. Management credentials required."}
 
     try:
         vendor = MerchantProfile.objects.get(id=vendor_id)
@@ -461,13 +462,10 @@ def toggle_vendor_approval(request, vendor_id: str, payload: ToggleApprovalSchem
     """
     Mutates verification status fields on a business node and broadcasts updates.
     """
+    _require_admin(request.auth)
+
     user = request.auth
-    if not user and hasattr(request, 'user'):
-        user = request.user
-
-    if not user or not user.is_authenticated or (user.role not in [CustomUser.Role.ADMIN, CustomUser.Role.STAFF] and not user.is_superuser):
-        return 403, {"detail": "Access unauthorized. Administrator credentials required."}
-
+    
     try:
         vendor = MerchantProfile.objects.get(id=vendor_id)
     except MerchantProfile.DoesNotExist:
@@ -530,12 +528,10 @@ def delete_vendor_profile(request, vendor_id: str):
     """
     Permanently purges a corporate profile anchor from the active ledger registry.
     """
-    user = request.auth
-    if not user and hasattr(request, 'user'):
-        user = request.user
+    _require_admin(request.auth)
 
-    if not user or not user.is_authenticated or (user.role != CustomUser.Role.ADMIN and not user.is_superuser):
-        return 403, {"detail": "Access unauthorized. Administrator credentials required."}
+    user = request.auth
+    
 
     try:
         vendor = MerchantProfile.objects.get(id=vendor_id)
@@ -563,12 +559,9 @@ def admin_toggle_vendor_suspension(request, vendor_id: str):
     """
     Allows administrators or superusers to toggle the operational store status.
     """
-    user = request.auth or request.user
-    if not user.is_authenticated:
-        raise HttpError(401, "Authentication credentials required.")
+    _require_admin(request.auth)
 
-    if not (user.is_superuser or getattr(user, 'role', None) == 'admin'):
-        raise HttpError(403, "Access Denied: Administrator privileges required.")
+    user = request.auth or request.user
 
     try:
         vendor = MerchantProfile.objects.get(id=vendor_id)
@@ -595,12 +588,11 @@ def onboard_user(request, payload: StaffOnboardingInput):
     """
     Register a new internal user (Admin, Staff, or Support Agent) and initialize their profile.
     """
-    user = request.auth
-    if not user and hasattr(request, 'user'):
-        user = request.user
 
-    if not user or not user.is_authenticated or (user.role != CustomUser.Role.ADMIN and not user.is_superuser):
-        return 403, {"detail": "Access denied. Administrator credentials required to onboard internal users."}
+    _require_admin(request.auth)
+
+    user = request.auth
+    
 
     if User.objects.filter(email=payload.email).exists():
         return 400, {"detail": "Email address is already registered."}
@@ -651,13 +643,11 @@ def onboard_user(request, payload: StaffOnboardingInput):
 
 @router.get("/staff", response={200: StaffListResponseOut, 403: dict})
 def all_staff(request):
+
+    _require_admin(request.auth)
+
     user = request.auth
-    if not user and hasattr(request, 'user'):
-        user = request.user
-
-    if not user or not user.is_authenticated or (user.role != CustomUser.Role.ADMIN and not user.is_superuser):
-        return 403, {"detail": "Access denied. Administrator credentials required to view staff records."}
-
+    
     staff_queryset = (
         CustomUser.objects.filter(role=CustomUser.Role.STAFF)
         .select_related('staff_profile', 'base_location__state')
@@ -689,12 +679,10 @@ def all_staff(request):
 
 @router.get("/agents", response={200: AgentListResponseOut, 403: dict})
 def all_agents(request):
-    user = request.auth
-    if not user and hasattr(request, 'user'):
-        user = request.user
+    _require_admin(request.auth)
 
-    if not user or not user.is_authenticated or (user.role != CustomUser.Role.ADMIN and not user.is_superuser):
-        return 403, {"detail": "Access denied. Administrator credentials required to view agent records."}
+    user = request.auth
+    
 
     agent_queryset = (
         CustomUser.objects.filter(role=CustomUser.Role.AGENT)
@@ -733,6 +721,9 @@ def toggle_staff_suspension(request, staff_id: str):
     """
     Toggles the active suspension state of a staff member's underlying user account.
     """
+
+    _require_admin(request.auth)
+
     if not _is_admin(request.user):
         return 403, {"detail": "Admin privileges required."}
 
@@ -773,10 +764,10 @@ def list_subscription_plans(request):
     """
     API endpoint for platform administrators and merchants to list all available subscription plans.
     """
-    user = request.auth or getattr(request, 'user', None)
 
-    if not user or not user.is_authenticated or (user.role != CustomUser.Role.ADMIN and not user.is_superuser):
-        return 403, {"detail": "Access denied. Administrator credentials required to view subscription plans."}
+    _require_admin(request.auth)
+
+    user = request.auth
 
     plans = SubscriptionPlan.objects.all().order_by('price')
     return 200, plans
@@ -787,12 +778,10 @@ def admin_create_subscription_plan(request, payload: SubscriptionPlanCreateSchem
     API endpoint for platform administrators to securely compile, validate,
     and provision new core subscription tiers.
     """
-    user = request.auth
-    if not user and hasattr(request, 'user'):
-        user = request.user
+    _require_admin(request.auth)
 
-    if not user or not user.is_authenticated or (user.role != CustomUser.Role.ADMIN and not user.is_superuser):
-        return 403, {"detail": "Access unauthorized. Administrator credentials required."}
+    user = request.auth
+    
 
     try:
         plan = SubscriptionPlan.objects.create(
@@ -816,12 +805,11 @@ def admin_update_subscription_plan(request, plan_id: int, payload: SubscriptionP
     """
     API endpoint for platform administrators to modify existing subscription tier parameters.
     """
-    user = request.auth
-    if not user and hasattr(request, 'user'):
-        user = request.user
 
-    if not user or not user.is_authenticated or (user.role != CustomUser.Role.ADMIN and not user.is_superuser):
-        return 403, {"detail": "Access unauthorized. Administrator credentials required."}
+    _require_admin(request.auth)
+
+    user = request.auth
+    
 
     plan = get_object_or_404(SubscriptionPlan, id=plan_id)
 
@@ -845,13 +833,10 @@ def admin_delete_subscription_plan(request, plan_id: int):
     """
     API endpoint for platform administrators to delete a subscription tier.
     """
+    _require_admin(request.auth)
+
     user = request.auth
-    if not user and hasattr(request, 'user'):
-        user = request.user
-
-    if not user or not user.is_authenticated or (user.role != CustomUser.Role.ADMIN and not user.is_superuser):
-        return 403, {"detail": "Access unauthorized. Administrator credentials required."}
-
+    
     plan = get_object_or_404(SubscriptionPlan, id=plan_id)
 
     if plan.vendorsubscription_set.filter(is_active=True).exists():
@@ -894,12 +879,10 @@ def list_admin_customers(request):
     """
     Retrieves all registered customer profiles directly from IndividualProfile.
     """
-    user = request.auth
-    if not user and hasattr(request, 'user'):
-        user = request.user
+    _require_admin(request.auth)
 
-    if not user or not user.is_authenticated or (user.role != CustomUser.Role.ADMIN and not user.is_superuser):
-        return 403, {"detail": "Admin privileges required."}
+    user = request.auth
+    
 
     users_qs = IndividualProfile.objects.select_related('user').all()
     customers_data = []
@@ -930,12 +913,10 @@ def list_admin_riders(request):
     """
     Retrieves all registered rider profiles for admin management.
     """
-    user = request.auth
-    if not user and hasattr(request, 'user'):
-        user = request.user
+    _require_admin(request.auth)
 
-    if not user or not user.is_authenticated or (user.role != CustomUser.Role.ADMIN and not user.is_superuser):
-        raise HttpError(403, "Admin privileges required.")
+    user = request.auth
+    
     
     riders_qs = RiderProfile.objects.select_related('user').all()
     riders_data = []
@@ -962,8 +943,7 @@ def get_admin_rider_detail(request, rider_id: str):
     """
     Retrieves a specific rider profile along with their complete review history.
     """
-    if not request.user or not request.user.is_authenticated or not request.user.is_staff:
-        return 403, {"detail": "Admin privileges required."}
+    _require_admin(request.auth)
 
     try:
         rider = RiderProfile.objects.select_related('user').get(id=rider_id)
@@ -1032,8 +1012,7 @@ def get_admin_rider_detail(request, rider_id: str):
     target_getter=lambda req, rider_id, **kw: f"Rider Profile #{rider_id}"
 )
 def verify_rider_id(request, rider_id: str, approved: bool):
-    if not request.user or not request.user.is_staff:
-        raise HttpError(403, "Admin privileges required.")
+    _require_admin(request.auth)
     
     rider = get_object_or_404(RiderProfile, id=rider_id)
     rider.is_id_verified = approved
@@ -1056,8 +1035,7 @@ def toggle_rider_suspension(request, rider_id: str):
     """
     Toggles the active suspension state of a rider's underlying user account.
     """
-    if not request.user or not request.user.is_authenticated or not request.user.is_staff:
-        return 403, {"detail": "Admin privileges required."}
+    _require_admin(request.auth)
 
     try:
         profile = RiderProfile.objects.select_related('user').get(id=rider_id)
@@ -1080,8 +1058,7 @@ def audit_rider_payouts(request, schedule: Optional[str] = None):
     """
     Audit riders by payout schedule (daily/weekly) and view wallet balances.
     """
-    if request.user.role not in ['admin', 'staff']:
-        raise HttpError(403, "Access restricted.")
+    _require_admin(request.auth)
     
     queryset = RiderProfile.objects.select_related('user').all()
     if schedule:
@@ -1111,8 +1088,7 @@ def mark_rider_payout_completed(request, rider_id: str):
     """
     Marks a rider's accumulated balance as settled/paid out.
     """
-    if request.user.role not in ['admin', 'staff']:
-        raise HttpError(403, "Access restricted.")
+    i_require_admin(request.auth)
     
     try:
         rider = RiderProfile.objects.get(id=rider_id)
@@ -1131,12 +1107,7 @@ def admin_reassign_order(request, order_id: str, data: ReassignOrderSchema):
     """
     Reassigns an active order to a new delivery rider.
     """
-    user = request.auth or request.user
-    if not user.is_authenticated:
-        raise HttpError(401, "Authentication credentials required.")
-
-    if not (user.is_superuser or getattr(user, 'role', None) == 'admin'):
-        raise HttpError(403, "Access Denied: Administrator privileges required.")
+    _require_admin(request.auth)
 
     def execute_admin_reassignment():
         with transaction.atomic():
@@ -1174,8 +1145,7 @@ def admin_reassign_order(request, order_id: str, data: ReassignOrderSchema):
 # ###########################################################
 @router.get("/audits/logs", response=List[AuditLogOut])
 def list_audit_logs(request):
-    if request.user.role != 'admin':
-        raise HttpError(403, "Access restricted.")
+    _require_admin(request.auth)
     
     logs = SystemAuditLog.objects.select_related('user').all().order_by('-created_at')[:100]
     return [
@@ -1191,8 +1161,7 @@ def list_audit_logs(request):
 
 @router.get("/disputes", response=List[DisputeOut])
 def list_disputes(request):
-    if request.user.role not in ['admin', 'staff']:
-        raise HttpError(403, "Access restricted.")
+    _require_admin(request.auth)
     
     disputes = OrderDisputeRefund.objects.all().order_by('-created_at')
     return [
@@ -1214,8 +1183,7 @@ def list_disputes(request):
     target_getter=lambda req, dispute_id, action, **kw: f"Dispute #{dispute_id}"
 )
 def resolve_dispute(request, dispute_id: int, action: str):
-    if request.user.role != 'admin':
-        raise HttpError(403, "Access restricted.")
+    _require_admin(request.auth)
     
     try:
         dispute = OrderDisputeRefund.objects.get(id=dispute_id)
@@ -1232,9 +1200,7 @@ def resolve_dispute(request, dispute_id: int, action: str):
 # ###############################################################################
 @router.get("/reviews")
 def admin_list_customer_reviews(request):
-    user = getattr(request, 'auth', None) or getattr(request, 'user', None)
-    if not user or not user.is_authenticated or not getattr(user, 'is_superuser', False):
-        raise HttpError(403, "Admin access required.")
+    _require_admin(request.auth)
 
     reviews = CustomerReview.objects.all().order_by('-created_at')
     
@@ -1257,9 +1223,7 @@ def admin_list_customer_reviews(request):
     target_getter=lambda req, review_id, **kw: f"Customer Review #{review_id}"
 )
 def admin_approve_review(request, review_id: int):
-    user = getattr(request, 'auth', None) or getattr(request, 'user', None)
-    if not user or not user.is_authenticated or not getattr(user, 'is_superuser', False):
-        raise HttpError(403, "Admin access required.")
+    _require_admin(request.auth)
 
     review = get_object_or_404(CustomerReview, id=review_id)
     review.is_approved = True
@@ -1272,9 +1236,7 @@ def admin_approve_review(request, review_id: int):
     target_getter=lambda req, review_id, **kw: f"Delete Customer Review #{review_id}"
 )
 def admin_delete_review(request, review_id: int):
-    user = getattr(request, 'auth', None) or getattr(request, 'user', None)
-    if not user or not user.is_authenticated or not getattr(user, 'is_superuser', False):
-        raise HttpError(403, "Admin access required.")
+    _require_admin(request.auth)
 
     review = get_object_or_404(CustomerReview, id=review_id)
     review.delete()
@@ -1282,9 +1244,7 @@ def admin_delete_review(request, review_id: int):
 
 @router.get("/faqs")
 def admin_list_faqs(request):
-    user = getattr(request, 'auth', None) or getattr(request, 'user', None)
-    if not user or not user.is_authenticated or not getattr(user, 'is_superuser', False):
-        raise HttpError(403, "Admin access required.")
+    _require_admin(request.auth)
     
     faqs = FrequentlyAskedQuestion.objects.all()
     return {
@@ -1305,9 +1265,7 @@ def admin_list_faqs(request):
     target_getter=lambda req, **kw: f"FAQs Created"
 )
 def admin_create_faq(request, payload: FAQSchema):
-    user = getattr(request, 'auth', None) or getattr(request, 'user', None)
-    if not user or not user.is_authenticated or not getattr(user, 'is_superuser', False):
-        raise HttpError(403, "Admin access required.")
+    _require_admin(request.auth)
 
     faq = FrequentlyAskedQuestion.objects.create(
         question=payload.question,
@@ -1323,9 +1281,7 @@ def admin_create_faq(request, payload: FAQSchema):
     target_getter=lambda req, faq_id, **kw: f"Delete FAQs #{faq_id}"
 )
 def admin_delete_faq(request, faq_id: int):
-    user = getattr(request, 'auth', None) or getattr(request, 'user', None)
-    if not user or not user.is_authenticated or not getattr(user, 'is_superuser', False):
-        raise HttpError(403, "Admin access required.")
+    _require_admin(request.auth)
 
     faq = get_object_or_404(FrequentlyAskedQuestion, id=faq_id)
     faq.delete()
@@ -1334,9 +1290,7 @@ def admin_delete_faq(request, faq_id: int):
 
 @router.get("/newsletter/subscribers")
 def admin_list_subscribers(request):
-    user = getattr(request, 'auth', None) or getattr(request, 'user', None)
-    if not user or not user.is_authenticated or not getattr(user, 'is_superuser', False):
-        raise HttpError(403, "Admin access required.")
+    _require_admin(request.auth)
     
     subscribers = NewsletterSubscriber.objects.filter(is_active=True).order_by('-subscribed_at')
     return {
@@ -1355,9 +1309,7 @@ def admin_list_subscribers(request):
     target_getter=lambda req, **kw: f"Broadcast news letter"
 )
 def admin_broadcast_newsletter(request, payload: NewsletterBroadcastSchema):
-    user = getattr(request, 'auth', None) or getattr(request, 'user', None)
-    if not user or not user.is_authenticated or not getattr(user, 'is_superuser', False):
-        raise HttpError(403, "Admin access required.")
+    _require_admin(request.auth)
 
     try:
         sent_count, total_recipients = send_newsletter(payload.subject, payload.content, payload.template_type)
@@ -1378,9 +1330,7 @@ def admin_broadcast_newsletter(request, payload: NewsletterBroadcastSchema):
 
 @router.post("/broadcasts/send", response={200: dict}, auth=JWTAuth())
 def send_system_broadcast(request, payload: BroadcastCreateSchema):
-    user = request.auth or getattr(request, 'user', None)
-    if not user or not user.is_authenticated or (not user.is_superuser and not user.is_staff):
-        raise HttpError(403, "Management authorization required.")
+    _require_admin(request.auth)
 
     if payload.target_audience not in ('all', 'vendors', 'merchants', 'riders', 'customers'):
         raise HttpError(400, "Invalid target audience.")
@@ -1446,12 +1396,7 @@ def send_system_broadcast(request, payload: BroadcastCreateSchema):
 
 @router.post("/locations", response={201: LocationResponse})
 def create_coverage_area(request, payload: LocationCreateInput):
-    user = request.auth
-    if not user and hasattr(request, 'user'):
-        user = request.user
-
-    if not user or not user.is_authenticated or (user.role != CustomUser.Role.ADMIN and not user.is_superuser):
-        raise HttpError(403, "Admin privileges required.")
+    _require_admin(request.auth)
 
     state_title = payload.state_name.strip().title()
     area_title = payload.area_name.strip().title()
@@ -1484,12 +1429,7 @@ def admin_get_platform_referral_setting(request):
     """
     API endpoint for platform administrators to fetch the current singleton core platform referral settings.
     """
-    user = request.auth
-    if not user and hasattr(request, 'user'):
-        user = request.user
-
-    if not user or not user.is_authenticated or (user.role != CustomUser.Role.ADMIN and not user.is_superuser):
-        return 403, {"detail": "Access unauthorized. Administrator credentials required."}
+    _require_admin(request.auth)
 
     try:
         settings_obj = PlatformSetting.get_settings()
@@ -1502,12 +1442,7 @@ def admin_create_platform_referral_setting_plan(request, payload: PlatformSettin
     """
     API endpoint for platform administrators to securely update or provision the singleton core platform referral settings.
     """
-    user = request.auth
-    if not user and hasattr(request, 'user'):
-        user = request.user
-
-    if not user or not user.is_authenticated or (user.role != CustomUser.Role.ADMIN and not user.is_superuser):
-        return 403, {"detail": "Access unauthorized. Administrator credentials required."}
+    _require_admin(request.auth)
 
     try:
         plan, created = PlatformSetting.objects.update_or_create(
@@ -1528,7 +1463,7 @@ def get_delivery_config(request):
     """Fetch current global delivery pricing configuration."""
     # Enforce admin permission check here based on your auth setup
     # e.g., if not request.user.is_staff: raise HttpError(403, "Admin access required.")
-    
+    _require_admin(request.auth)
     config = DeliveryConfig.get_solo()
     return {
         "full_time_rider_earning": config.full_time_rider_earning,
@@ -1540,7 +1475,7 @@ def get_delivery_config(request):
 def update_delivery_config(request, payload: DeliveryConfigUpdateIn):
     """Update global delivery earnings and platform cut percentages."""
     # if not request.user.is_staff: raise HttpError(403, "Admin access required.")
-    
+    _require_admin(request.auth)
     config = DeliveryConfig.get_solo()
 
     # Update fields only if provided in the payload
