@@ -216,8 +216,6 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
         raise HttpError(404, "Approved vendor profile not found.")
 
     # Resolve last order history cleanly if user session context is authenticated
-    # This endpoint is public, so the bearer token (if any) is read manually.
-    # (The old query compared a CustomUser to profile FKs and always failed silently.)
     last_order_ref = ''
     viewer = _optional_user(request)
     if viewer:
@@ -242,7 +240,6 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
     reviews_list = []
     reviews_query = vendor.reviews.select_related('customer', 'customer__individual_profile').order_by('-created_at')[:15]
     for review in reviews_query:
-        # Never expose reviewers' e-mail addresses on a public page.
         profile = getattr(review.customer, 'individual_profile', None)
         first = (getattr(profile, 'first_name', '') or '').strip()
         last = (getattr(profile, 'last_name', '') or '').strip()
@@ -259,6 +256,9 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
     # Safely extract base location name
     base_loc_name = str(vendor.user.base_location.name) if (vendor.user and vendor.user.base_location) else ''
 
+    # Get or create storefront config universally for all business types so hero_image always works
+    storefront_config, _ = StorefrontConfig.objects.get_or_create(profile=vendor)
+
     base_data = {
         "vendor_id": vendor.id,
         "company_name": vendor.company_name,
@@ -269,7 +269,15 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
         "is_currently_open": getattr(vendor, 'is_currently_open', True),
         "last_order_ref": last_order_ref,
         "ratings_distribution": ratings_matrix,
-        "reviews": reviews_list
+        "reviews": reviews_list,
+        "storefront_meta": {
+            "hero_image": storefront_config.hero_image.url if storefront_config.hero_image else None,
+            "store_slug": storefront_config.store_slug,
+            "tagline": storefront_config.tagline,
+            "brand_bio": storefront_config.brand_bio,
+            "instagram_handle": storefront_config.instagram_handle,
+            "twitter_handle": storefront_config.twitter_handle,
+        }
     }
 
     product_query = vendor.products.filter(is_available=True).select_related('sub_category', 'brand')
@@ -278,8 +286,6 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
     # BRANCH A: E-COMMERCE RETAIL LOGIC
     # -------------------------------------------------------------------------
     if vendor.business_type == 'e_commerce':
-        storefront_config, _ = StorefrontConfig.objects.get_or_create(profile=vendor)
-        
         if filters.subcategory:
             product_query = product_query.filter(sub_category__name__iexact=filters.subcategory)
 
@@ -309,14 +315,6 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
                     "name": cat['sub_category__name']
                 })
 
-        base_data["storefront_meta"] = {
-            "hero_image": storefront_config.hero_image.url if storefront_config.hero_image else None,
-            "store_slug": storefront_config.store_slug,
-            "tagline": storefront_config.tagline,
-            "brand_bio": storefront_config.brand_bio,
-            "instagram_handle": storefront_config.instagram_handle,
-            "twitter_handle": storefront_config.twitter_handle,
-        }
         base_data["sidebar_categories"] = categories_sidebar
         base_data["products"] = products_list
 
@@ -327,11 +325,10 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
         if filters.subcategory:
             product_query = product_query.filter(sub_category__name__iexact=filters.subcategory)
 
-        # FIX: Use Prefetch object to filter available options in a single query
         available_options_prefetch = Prefetch(
             'menu_options',
             queryset=MenuItemOption.objects.filter(is_available=True),
-            to_attr='filtered_menu_options'  # stores results in a Python list attribute
+            to_attr='filtered_menu_options'
         )
         product_query = product_query.prefetch_related(available_options_prefetch)
 
@@ -346,7 +343,6 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
             if category_name not in categories_dict:
                 categories_dict[category_name] = []
 
-            # Gather restaurant custom pricing options from the prefetched list (No extra DB hits!)
             menu_options_list = []
             for option in product.filtered_menu_options:
                 menu_options_list.append({

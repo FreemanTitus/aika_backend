@@ -360,6 +360,11 @@ def _valid_coordinate(value, limit):
         return None
     return number if -limit <= number <= limit else None
 
+def base_delivery_fare() -> Decimal:
+    """The platform's minimum delivery fee (what a nearby order costs)."""
+    config = LogisticsPricingConfig.objects.first()
+    return Decimal(str(config.base_fare)) if config and config.base_fare is not None else Decimal("1000.00")
+    
 
 MAX_AREA_RADIUS_KM = 50  # a hub's delivery zone; coordinates farther than this are not believed
 
