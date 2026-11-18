@@ -32,8 +32,8 @@ from .schemas import (
     StorefrontFilters, SubCategoryFilterSchema,
 )
 from .utils import (
-    _calculate_distance_delivery_fee, apply_wallet_to_order, decide_fulfillment, ensure_payment_link,
-    parse_clean_id, release_unpaid_order,
+    AreaRequiredError, _calculate_distance_delivery_fee, apply_wallet_to_order, decide_fulfillment, ensure_payment_link,
+    parse_clean_id, release_unpaid_order, sanitize_customer_coordinates, _resolve_buyer_area
 )
 
 router = Router(tags=["Marketplace Storefront"])
@@ -174,7 +174,7 @@ def get_marketplace_vendors_api(request, customer_location_id: Optional[int] = N
 
         b_type = str(vendor.business_type).lower().strip()
 
-        if b_type in ['restaurant', 'meals']:
+        if b_type in ['restaurant']:
             # --- RESTAURANT GEOFENCING LOGIC ---
             # Only include restaurant if customer location matches the vendor's hub location
             if customer_location_id is not None:
@@ -831,7 +831,11 @@ def _sync_atomic_order_writer(customer_profile, vendor, input_data):
             vendor_lng = getattr(vendor, 'longitude', None) or getattr(vendor_user, 'longitude', None)
             customer_lat = input_data.latitude or getattr(customer_profile, 'latitude', None)
             customer_lng = input_data.longitude or getattr(customer_profile, 'longitude', None)
-
+            # Never trust device coordinates blindly: they must fall inside the chosen delivery area.
+            customer_lat, customer_lng = sanitize_customer_coordinates(
+                customer_lat, customer_lng,
+                _resolve_buyer_area(input_data.base_location, customer_profile),
+            )
             delivery_charge = _calculate_distance_delivery_fee(vendor_lat, vendor_lng, customer_lat, customer_lng)
 
         total = running_items_subtotal + delivery_charge
@@ -1034,38 +1038,89 @@ def order_summary_api(request, order_id: str):
         "items": serialized_items
     }
 
-@router.post("/delivery/quote", auth=JWTAuth())
-def get_live_delivery_quote(request, payload: QuoteRequestSchema):
+@router.post("/quote-delivery/{vendor_id}", auth=JWTAuth())
+def quote_delivery_fee_api(request, vendor_id: str, data: QuoteRequestInput):
     """
-    Calculates a flat operational delivery fee while caching 
-    the customer's descriptive street address text details.
+    Predicts the delivery option and fee checkout will apply: platform riders (distance fee,
+    wallet credit applied) or the vendor's own delivery (the vendor's flat charge, no wallet).
     """
-    if not request.user or request.user.is_anonymous:
-        raise HttpError(401, "Missing credentials.")
-        
+    user = request.user
+    clean_vendor_id = vendor_id.strip()
+
+    vendor = MerchantProfile.objects.select_related(
+        'user', 'user__base_location', 'shipping_preference'
+    ).filter(
+        id__iexact=clean_vendor_id,
+        is_approved=True
+    ).first()
+
+    if not vendor:
+        raise HttpError(404, "Vendor storefront profile not found or not approved.")
+
+    customer_profile = IndividualProfile.objects.select_related('user', 'user__base_location').filter(user=user).first()
+
     try:
-        # Retrieve profiles context safely
-        merchant_profile = MerchantProfile.objects.select_related('user').get(id=payload.merchant_id)
-        customer_profile = IndividualProfile.objects.select_related('user').get(user=request.user)
-        customer_user = customer_profile.user
-    except (MerchantProfile.DoesNotExist, IndividualProfile.DoesNotExist):
-        raise HttpError(404, "Invalid logistics profiles mapping.")
+        mode, vendor_fee = decide_fulfillment(vendor, customer_profile, data.base_location)
+    except AreaRequiredError as exc:
+        # The UI asks the customer to pick an area, then asks for the quote again.
+        return {
+            "status": "needs_area",
+            "message": str(exc),
+            "fulfillment_mode": None,
+            "delivered_by": None,
+            "delivery_fee": 0.0,
+            "wallet_balance": 0.0,
+            "wallet_applied_to_delivery": 0.0,
+            "net_delivery_fee": 0.0,
+        }
+    except ValueError as exc:
+        raise HttpError(400, str(exc))
 
-    # Cache custom street address details if sent from the checkout page
-    customer_street = ""
-    if hasattr(payload, 'street_address') and payload.street_address:
-        customer_street = payload.street_address.strip()
-        customer_user.street_address = customer_street
-        customer_user.save(update_fields=['street_address'])
-    else:
-        customer_street = customer_user.street_address or ""
+    if mode == MarketplaceOrder.FulfillmentMode.VENDOR_SELF_DELIVERY:
+        fee = Decimal(vendor_fee or 0)
+        return {
+            "status": "success",
+            "fulfillment_mode": mode,
+            "delivered_by": "vendor",
+            "message": f"{vendor.company_name} will deliver this order itself.",
+            "delivery_fee": float(fee),
+            "wallet_balance": 0.0,
+            "wallet_applied_to_delivery": 0.0,
+            "net_delivery_fee": float(fee),
+        }
 
-    # Run the calculation directly using the updated flat rate utility
-    pricing_matrix = compute_tariff_breakdown(distance_km=0.0)
-    pricing_matrix["customer_street_address"] = customer_street
-    pricing_matrix["routing_method"] = "fixed_flat_rate_launch"
-    
-    return {"status": "success", "data": pricing_matrix}
+    wallet_balance = Decimal('0.00')
+    if user and not user.is_anonymous:
+        try:
+            wallet = CustomerWallet.objects.get(user=user, is_active=True)
+            wallet_balance = wallet.balance
+        except CustomerWallet.DoesNotExist:
+            pass
+
+    vendor_lat = getattr(vendor, 'latitude', None) or (getattr(vendor, 'user', None) and getattr(vendor.user, 'latitude', None)) or ''
+    vendor_lng = getattr(vendor, 'longitude', None) or (getattr(vendor, 'user', None) and getattr(vendor.user, 'longitude', None)) or ''
+
+    quote_lat, quote_lng = sanitize_customer_coordinates(
+        data.latitude, data.longitude, _resolve_buyer_area(data.base_location, customer_profile)
+    )
+    delivery_fee = _calculate_distance_delivery_fee(
+        vendor_lat, vendor_lng, quote_lat or '', quote_lng or ''
+    )
+
+    wallet_applied = min(delivery_fee, wallet_balance)
+    net_delivery_fee = delivery_fee - wallet_applied
+
+    return {
+        "status": "success",
+        "fulfillment_mode": mode,
+        "delivered_by": "platform",
+        "message": "",
+        "delivery_fee": float(delivery_fee),
+        "wallet_balance": float(wallet_balance),
+        "wallet_applied_to_delivery": float(wallet_applied),
+        "net_delivery_fee": float(net_delivery_fee)
+    }
+
 
 @router.get("/receipt/{order_id}", auth=JWTAuth())
 def download_receipt(request, order_id: str):

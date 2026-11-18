@@ -9,9 +9,7 @@ CategoryLiteral = Literal[
     "apparel",
     "appliances",
     "beauty",
-    "meals",
-    "drinks",
-    "sides",
+    "restaurant",
     "general",
 ]
 
@@ -95,6 +93,11 @@ class VendorOrderSchema(Schema):
     status: str
     assigned_rider: Optional[RiderInfoSchema] = None
     created_at: str
+    # "waybill" = delivered by Aika riders (id is the logistics order id);
+    # "vendor_delivery" = delivered by the vendor (id is the marketplace order id, no rider).
+    kind: str = "waybill"
+    fulfillment_mode: Optional[str] = None
+    can_cancel: bool = False
 
 class VendorOrdersResponseSchema(Schema):
     status: str

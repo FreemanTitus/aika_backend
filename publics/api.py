@@ -1,3 +1,5 @@
+from django.conf import settings
+import logging
 from django.core.exceptions import ValidationError
 from django.core.validators import validate_email
 from ninja import Router
@@ -7,6 +9,8 @@ from .schemas import NewsletterSubscribeSchema
 from customers.models import FrequentlyAskedQuestion
 from accounts.models import CustomerReview
 from accounts.schemas import CustomerReviewSchema
+
+logger = logging.getLogger(__name__)
 
 router = Router()
 
@@ -78,3 +82,22 @@ def list_public_faqs(request):
             } for f in faqs
         ]
     }
+
+
+@router.get("/vapid-key")
+def get_vapid_public_key(request):
+    """
+    Public VAPID key the browser needs for push subscriptions (so it is not hard-coded in the
+    frontend). It must be the raw 65-byte uncompressed P-256 key, base64url encoded.
+    """
+    import base64
+
+    key = str(getattr(settings, "VAPID_PUBLIC_KEY", "") or "").strip()
+    try:
+        raw = base64.urlsafe_b64decode(key + "=" * (-len(key) % 4))
+    except Exception:
+        raw = b""
+    if len(raw) != 65 or raw[0] != 0x04:
+        logger.error("VAPID_PUBLIC_KEY is not a raw 65-byte uncompressed P-256 key; push cannot work.")
+        raise HttpError(503, "Push notifications are not configured.")
+    return {"public_key": key}

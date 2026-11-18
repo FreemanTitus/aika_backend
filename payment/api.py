@@ -205,6 +205,25 @@ def verify_subscription_payment(request, invoice_id: int):
         payment_status = inner_data.get("status") or inner_data.get("result") or response_data.get("status")
 
         if api_code == "00000" and payment_status in ["SUCCESSFUL", "PAID", "SUCCESS"]:
+            # The amount OPay reports must cover the invoice (we send/expect minor units, kobo).
+            reported = inner_data.get("amount")
+            reported_total = reported.get("total") if isinstance(reported, dict) else reported
+            reported_currency = reported.get("currency") if isinstance(reported, dict) else inner_data.get("currency")
+            if reported_total is not None:
+                try:
+                    paid_kobo = Decimal(str(reported_total))
+                except Exception:
+                    paid_kobo = Decimal("0")
+                expected_kobo = (Decimal(invoice.amount) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+                if paid_kobo < expected_kobo or (reported_currency and str(reported_currency).upper() != "NGN"):
+                    logger.error(
+                        "OPay amount mismatch for invoice %s: paid=%s %s expected=%s",
+                        invoice_id, paid_kobo, reported_currency, expected_kobo,
+                    )
+                    return 400, {"success": False, "detail": "The amount paid does not match this invoice. Please contact support."}
+            else:
+                logger.warning("OPay status response for invoice %s has no amount to compare", invoice_id)
+
             with transaction.atomic():
                 # Lock the invoice so two simultaneous callbacks apply the upgrade only once.
                 locked = SubscriptionInvoice.objects.select_for_update().select_related('plan', 'vendor_profile').get(pk=invoice_id)

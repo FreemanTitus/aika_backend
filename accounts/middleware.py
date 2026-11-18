@@ -44,7 +44,29 @@ class TokenAuthMiddleware:
         scope["user"] = user if user else AnonymousUser()
         return await self.inner(scope, receive, send)
 
+class JWTUserForWebpushMiddleware:
+    """
+    django-webpush stores a subscription against `request.user`, which only knows SESSION logins,
+    while this API authenticates with JWTs. For /webpush/ requests the Authorization bearer token
+    is resolved here so the subscription is saved against the real user. Without it every
+    subscription is anonymous and user-targeted pushes (order updates) can never be delivered.
+    """
 
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if request.path.startswith("/webpush/"):
+            header = request.META.get("HTTP_AUTHORIZATION", "")
+            if header.startswith("Bearer "):
+                try:
+                    user = verify_jwt_token(header.split(" ", 1)[1].strip())
+                except Exception:
+                    user = None
+                if user:
+                    request.user = user
+        return self.get_response(request)
+    
 class PlatformSecurityMiddleware:
     """
     Per-IP, per-bucket rate limiting for sensitive endpoints plus a captcha gate

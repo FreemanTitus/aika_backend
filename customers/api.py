@@ -910,7 +910,7 @@ def mark_notification_as_read(request, notif_type: str, notif_id: int):
         notification.save(update_fields=['is_read'])
         return {"status": "success", "message": "Notification marked as read."}
     
-@router.post("/customer/notifications/mark-all-read", response={200: dict})
+@router.post("/notifications/mark-all-read", response={200: dict})
 async def mark_all_notifications_as_read(request):
     """
     Mark all unread personal notifications as read asynchronously.

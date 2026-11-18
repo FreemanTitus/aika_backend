@@ -35,6 +35,11 @@ class IndividualProfile(models.Model):
     referred_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='referrals_made')
     referral_reward_unlocked = models.BooleanField(default=False)
 
+    @property
+    def full_name(self) -> str:
+        """Dynamically returns the combined full name."""
+        return f"{self.first_name} {self.last_name}".strip()
+
     def save(self, *args, **kwargs):
         if not self.referral_code:
             # Generate a unique 8-character alphanumeric referral code
@@ -46,7 +51,7 @@ class IndividualProfile(models.Model):
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return f"{self.first_name} {self.last_name} (Customer)"
+        return f"{self.full_name} (Customer)"
 
 
 class Referral(models.Model):

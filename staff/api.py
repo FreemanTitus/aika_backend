@@ -216,7 +216,37 @@ async def get_staff_vendor_orders(request, vendor_id: str):
                 "total_amount": float(getattr(order, 'delivery_fee', 0) or 0),
                 "status": str(order.status).lower(),
                 "assigned_rider": rider_info,
-                "created_at": order.created_at.isoformat() if order.created_at else ""
+                "created_at": order.created_at.isoformat() if order.created_at else "",
+                "kind": "waybill",
+                "fulfillment_mode": "platform_dispatch",
+                "can_cancel": order.status in (
+                    Order.OrderStatus.PENDING, Order.OrderStatus.ACKNOWLEDGED, Order.OrderStatus.ASSIGNED
+                ),
+            })
+
+        # Vendor-delivered orders have no waybill, so they were invisible here (and could not be
+        # cancelled). List the ones that are past payment.
+        vendor_delivered = (
+            MarketplaceOrder.objects
+            .filter(vendor=vendor, fulfillment_mode=MarketplaceOrder.FulfillmentMode.VENDOR_SELF_DELIVERY)
+            .exclude(status=MarketplaceOrder.OrderStatus.PENDING)
+            .select_related('customer__user')
+            .order_by('-created_at')
+        )
+        for m_order in vendor_delivered:
+            c_user = m_order.customer.user if (m_order.customer and m_order.customer.user_id) else None
+            orders_data.append({
+                "id": str(m_order.id),
+                "customer_name": ((f"{c_user.first_name} {c_user.last_name}".strip()) if c_user else "") or "Valued Customer",
+                "total_amount": float(m_order.total_price or 0),
+                "status": str(m_order.status).lower(),
+                "assigned_rider": None,
+                "created_at": m_order.created_at.isoformat() if m_order.created_at else "",
+                "kind": "vendor_delivery",
+                "fulfillment_mode": m_order.fulfillment_mode,
+                "can_cancel": m_order.status in (
+                    MarketplaceOrder.OrderStatus.PAID_UNASSIGNED, MarketplaceOrder.OrderStatus.PROCESSING
+                ),
             })
 
         riders_qs = RiderProfile.objects.select_related('user').filter(is_active=True)
@@ -456,64 +486,66 @@ async def staff_reassign_order(request, order_id: str, data: ReassignOrderSchema
 @router.post("/order/{order_id}/cancel-refund")
 async def staff_cancel_refund_order(request, order_id: str, data: CancelOrderSchema):
     """
-    Cancels an order that has not been picked up yet and opens the refund workflow.
+    Cancels an order that has not been picked up / sent out yet and opens the refund workflow.
 
-    Only PENDING / ACKNOWLEDGED / ASSIGNED waybills can be cancelled (never an order that is
-    already in transit, delivered or completed: the vendor and rider have been paid by then).
-    The linked marketplace order is cancelled as well, reserved stock is restored, applied
-    wallet credit is refunded, and - for a PAID order - a refund request is queued for finance.
+    `order_id` is a logistics order id (digits) for rider deliveries, or a marketplace order id
+    for vendor-delivered orders (which have no waybill). Only unpaid/paid-but-not-dispatched
+    orders can be cancelled: the vendor and rider have been paid once a delivery is under way.
+    Reserved stock is restored, applied wallet credit is refunded and, for a PAID order, a refund
+    request is queued for finance.
     """
     user = request.auth
 
     @sync_to_async
     def execute_cancellation():
         with transaction.atomic():
+            user_role = getattr(user, 'role', None)
+            scoped_staff = user_role == "staff" and not user.is_superuser
+
+            # ---- vendor-delivered order (marketplace id) ----
+            if not str(order_id).isdigit():
+                m_order = (
+                    MarketplaceOrder.objects.select_related('vendor')
+                    .filter(id=order_id, fulfillment_mode=MarketplaceOrder.FulfillmentMode.VENDOR_SELF_DELIVERY)
+                    .first()
+                )
+                if m_order is None:
+                    raise HttpError(404, "Order trace not found.")
+                if scoped_staff and (m_order.vendor is None or m_order.vendor.assigned_agent_id != user.id):
+                    raise HttpError(403, "Unauthorized access to order.")
+
+                cancelled, was_paid = cancel_order_before_pickup(m_order.id)
+                if cancelled is None:
+                    raise HttpError(400, "This order can no longer be cancelled (it is already out for delivery or finished).")
+                return _queue_refund_request(cancelled, was_paid, data, user)
+
+            # ---- rider-delivered order (logistics id) ----
             try:
                 order = (
                     Order.objects.select_for_update(of=('self',))
                     .select_related('sender')
-                    .get(id=order_id)
+                    .get(id=int(order_id))
                 )
             except (Order.DoesNotExist, ValueError):
                 raise HttpError(404, "Order trace not found.")
 
-            user_role = getattr(user, 'role', None)
-            if user_role == "staff" and not user.is_superuser:
-                if order.sender is None or order.sender.assigned_agent_id != user.id:
-                    raise HttpError(403, "Unauthorized access to order.")
+            if scoped_staff and (order.sender is None or order.sender.assigned_agent_id != user.id):
+                raise HttpError(403, "Unauthorized access to order.")
 
             if order.status not in (
                 Order.OrderStatus.PENDING, Order.OrderStatus.ACKNOWLEDGED, Order.OrderStatus.ASSIGNED
             ):
                 raise HttpError(400, f"An order in '{order.status}' status can no longer be cancelled.")
 
-            refund_queued = False
             if order.marketplace_order_id:
-                m_order, was_paid = cancel_order_before_pickup(order.marketplace_order_id)
-                if m_order is None:
+                cancelled, was_paid = cancel_order_before_pickup(order.marketplace_order_id)
+                if cancelled is None:
                     raise HttpError(400, "This order can no longer be cancelled.")
+                return _queue_refund_request(cancelled, was_paid, data, user)
 
-                if was_paid and data.issue_refund:
-                    customer_user = m_order.customer.user if (m_order.customer and m_order.customer.user_id) else None
-                    already_open = OrderDisputeRefund.objects.filter(
-                        order_id=str(m_order.id),
-                        status=OrderDisputeRefund.StatusChoice.PENDING,
-                    ).exists()
-                    if not already_open:
-                        OrderDisputeRefund.objects.create(
-                            order_id=str(m_order.id),
-                            customer_name=(customer_user.get_full_name() or customer_user.email) if customer_user else "Customer",
-                            reason=(data.reason or "Cancelled by agent intervention")[:2000],
-                            amount=m_order.total_price,
-                            status=OrderDisputeRefund.StatusChoice.PENDING,
-                            raised_by=f"Staff: {user.email}",
-                        )
-                    refund_queued = True
-            else:
-                order.status = Order.OrderStatus.CANCELLED
-                order.save(update_fields=['status', 'updated_at'])
-
-            return refund_queued
+            order.status = Order.OrderStatus.CANCELLED
+            order.save(update_fields=['status', 'updated_at'])
+            return False
 
     refund_queued = await execute_cancellation()
     return {
@@ -775,3 +807,23 @@ def staff_send_vendor_message(request, conv_id: str, payload: ReplySchema):
             "created_at": message.created_at.isoformat()
         }
     }
+
+def _queue_refund_request(m_order, was_paid, data, staff_user) -> bool:
+    """Opens (once) a finance refund request for a cancelled PAID order. Returns True if one is open."""
+    if not (was_paid and data.issue_refund):
+        return False
+
+    customer_user = m_order.customer.user if (m_order.customer and m_order.customer.user_id) else None
+    already_open = OrderDisputeRefund.objects.filter(
+        order_id=str(m_order.id), status=OrderDisputeRefund.StatusChoice.PENDING
+    ).exists()
+    if not already_open:
+        OrderDisputeRefund.objects.create(
+            order_id=str(m_order.id),
+            customer_name=((customer_user.get_full_name() or customer_user.email) if customer_user else "Customer")[:150],
+            reason=(data.reason or "Cancelled by agent intervention")[:2000],
+            amount=m_order.total_price,
+            status=OrderDisputeRefund.StatusChoice.PENDING,
+            raised_by=f"Staff: {staff_user.email}"[:100],
+        )
+    return True

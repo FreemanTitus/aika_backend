@@ -101,6 +101,51 @@ def _paystack_confirms(order, reference) -> bool:
     return False
 
 
+def _queue_late_payment_refund(order, reference):
+    """
+    The customer paid for an order that had already been cancelled/released. Money was taken for
+    something we will not fulfil, so a refund request is opened for finance automatically
+    (idempotent: one open request per order) and the admin desk is alerted. Nothing is refunded
+    by code; finance approves it from the existing refund queue.
+    """
+    from audit.models import OrderDisputeRefund
+
+    marker = "[AUTO] Late payment received for cancelled order"
+    try:
+        with transaction.atomic():
+            if OrderDisputeRefund.objects.filter(order_id=str(order.id), reason__startswith=marker).exists():
+                return
+            customer_user = order.customer.user if (order.customer and order.customer.user_id) else None
+            refund = OrderDisputeRefund.objects.create(
+                order_id=str(order.id),
+                customer_name=((customer_user.get_full_name() or customer_user.email) if customer_user else "Customer")[:150],
+                reason=f"{marker} (payment reference {reference}). Refund the customer in full.",
+                amount=order.total_price,
+                status=OrderDisputeRefund.StatusChoice.PENDING,
+                raised_by="System (late payment)",
+            )
+
+            def _alert_admins():
+                try:
+                    from asgiref.sync import async_to_sync
+                    from channels.layers import get_channel_layer
+                    layer = get_channel_layer()
+                    if layer:
+                        async_to_sync(layer.group_send)("admin_notifications", {
+                            "type": "admin_notification_message",
+                            "message": {
+                                "title": "Late payment: refund required",
+                                "text": f"Order #{order.id} was paid after it was cancelled. A refund request of \u20a6{refund.amount:,.2f} was opened.",
+                                "dispute_id": refund.id,
+                            },
+                        })
+                except Exception:
+                    logger.exception("Admin alert failed for late-payment refund %s", order.id)
+
+            transaction.on_commit(_alert_admins)
+    except Exception:
+        logger.exception("Could not queue the late-payment refund for order %s", order.id)
+        
 def verify_order_payment(order_id, transaction_id=None):
     """
     Idempotent, race-safe payment confirmation. Returns True if the order is (now)

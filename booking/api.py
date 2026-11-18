@@ -8,7 +8,7 @@ router = Router(
      auth=JWTAuth()
 )
 
-@router.post("/ride/create")
+@router.post("/create/ride")
 def create_ride_api(request, data: RideBookingInput):
     """
     Validates and stores a new passenger ride booking.

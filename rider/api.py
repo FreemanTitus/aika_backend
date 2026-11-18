@@ -78,7 +78,7 @@ def get_rider_dashboard(request):
     
     wallet_stats = get_rider_wallet_stats(rider)
 
-    print("Wallet Stats", wallet_stats)
+    # print("Wallet Stats", wallet_stats)
 
     # Standard synchronous database query & evaluation
     active_deliveries = list(

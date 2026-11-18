@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser
 from .manager import CustomUserManager
+import logging
 import time
 from geopy.geocoders import Nominatim
 
@@ -25,27 +26,26 @@ class CoverageArea(models.Model):
     def __str__(self):
         return f"{self.name}, {self.state.name}"
 
-    def save(self, *args, **kwargs):
-        # Automatically fetch coordinates if they are not provided
-        if not self.latitude or not self.longitude:
-            try:
-                # Use a unique user_agent for your app
-                geolocator = Nominatim(user_agent="aika_marketplace_geocoder")
-                
-                # Format the query strictly for Nigeria
-                query = f"{self.name}, {self.state.name}, Nigeria"
-                location = geolocator.geocode(query)
-                
-                if location:
-                    self.latitude = location.latitude
-                    self.longitude = location.longitude
-                
-                # Respect Nominatim's strict rate limit of 1 request per second
-                time.sleep(1) 
-            except Exception as e:
-                print(f"Geocoding failed for {self.name}: {e}")
-                
-        super().save(*args, **kwargs)
+    def geocode(self, save=True) -> bool:
+        """
+        Looks up this area's coordinates on Nominatim. Network + a 1 s rate-limit pause, so it is
+        NEVER called from save()/requests: run `manage.py geocode_coverage_areas` (or call this from
+        a background job). Returns True when coordinates were found.
+        """
+        try:
+            geolocator = Nominatim(user_agent="aika_marketplace_geocoder", timeout=5)
+            location = geolocator.geocode(f"{self.name}, {self.state.name}, Nigeria")
+            if not location:
+                return False
+            self.latitude = location.latitude
+            self.longitude = location.longitude
+            if save:
+                super().save(update_fields=['latitude', 'longitude'])
+            time.sleep(1)  # Nominatim allows 1 request per second
+            return True
+        except Exception:
+            logging.getLogger(__name__).exception("Geocoding failed for %s", self.name)
+            return False
 
 
 class CustomUser(AbstractUser):

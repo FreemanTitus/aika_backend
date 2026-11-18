@@ -358,8 +358,8 @@ class MarketplaceOrder(models.Model):
         """Generates a secure tracking key before storing the record instance."""
         if not self.id:
             while True:
-                # Generates a human-scannable format like: MKO-A38F7E2K
-                potential_id = f"{generate_alphanumeric_id(8)}"
+                # Generates a human-scannable format like: A38F7E2K
+                potential_id = f"{generate_alphanumeric_id(12)}"
                 if not MarketplaceOrder.objects.filter(id=potential_id).exists():
                     self.id = potential_id
                     break

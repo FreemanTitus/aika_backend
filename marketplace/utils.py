@@ -137,6 +137,13 @@ def create_logistics_waybill(marketplace_order):
 # =========================================================================
 # FULFILLMENT ROUTING (platform riders vs. vendor self-delivery)
 # =========================================================================
+class AreaRequiredError(ValueError):
+    """The buyer's delivery area is needed to pick a delivery option (the quote asks for it)."""
+
+
+# =========================================================================
+# FULFILLMENT ROUTING (platform riders vs. vendor self-delivery)
+# =========================================================================
 def _resolve_buyer_area(base_location_input, customer_profile):
     """
     Finds the buyer's CoverageArea. Accepts an id, "Name, State" or a name that identifies
@@ -144,19 +151,30 @@ def _resolve_buyer_area(base_location_input, customer_profile):
     Falls back to the customer's saved base location.
     """
     raw = str(base_location_input or '').strip()
+    user = getattr(customer_profile, 'user', None)
+    saved_area = getattr(user, 'base_location', None) if user else None
+
     if raw:
         if raw.isdigit():
-            return CoverageArea.objects.filter(id=int(raw)).first()
-        if ',' in raw:
-            name, state = [part.strip() for part in raw.split(',', 1)]
-            area = CoverageArea.objects.filter(name__iexact=name, state__name__iexact=state).first()
+            area = CoverageArea.objects.filter(id=int(raw)).first()
             if area:
                 return area
-        matches = list(CoverageArea.objects.filter(name__iexact=raw.split(',')[0].strip())[:2])
-        return matches[0] if len(matches) == 1 else None
+        else:
+            if ',' in raw:
+                name, state = [part.strip() for part in raw.split(',', 1)]
+                area = CoverageArea.objects.filter(name__iexact=name, state__name__iexact=state).first()
+                if area:
+                    return area
+            name_only = raw.split(',')[0].strip()
+            matches = list(CoverageArea.objects.filter(name__iexact=name_only)[:2])
+            if len(matches) == 1:
+                return matches[0]
+            # Same name in several states: the customer's own saved hub settles it.
+            if len(matches) > 1 and saved_area and saved_area.name.lower() == name_only.lower():
+                return saved_area
 
-    user = getattr(customer_profile, 'user', None)
-    return getattr(user, 'base_location', None) if user else None
+    # Nothing usable was sent (e.g. free text): use the hub saved on the customer's account.
+    return saved_area
 
 
 def decide_fulfillment(vendor, customer_profile, base_location_input):
@@ -247,7 +265,7 @@ def _paystack_init_payload(order, customer_email) -> dict:
         "email": customer_email,
         "amount": _amount_in_kobo(order.total_price),
         "currency": "NGN",
-        "reference": f"REF-{order.id}-{uuid.uuid4().hex[:6].upper()}",
+        "reference": f"{order.id}{uuid.uuid4().hex[:6].upper()}",
         "callback_url": f"{str(settings.FRONTEND_URL).rstrip('/')}/marketplace/order/verify?order_id={order.id}",
         "metadata": {"order_id": str(order.id)},  # informational only, never used to find orders
     }
@@ -342,6 +360,35 @@ def _valid_coordinate(value, limit):
         return None
     return number if -limit <= number <= limit else None
 
+
+MAX_AREA_RADIUS_KM = 50  # a hub's delivery zone; coordinates farther than this are not believed
+
+def _haversine_km(lat1, lng1, lat2, lng2) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlat, dlng = p2 - p1, math.radians(lng2 - lng1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlng / 2) ** 2
+    return 6371 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+def sanitize_customer_coordinates(lat, lng, buyer_area):
+    """
+    The delivery fee is distance based and the coordinates come from the customer's device, so a
+    customer could claim to be right next to the vendor to cut the fee. The coordinates are only
+    trusted when they fall inside the selected delivery area; otherwise (or when missing) the
+    area's own centre is used, which prices the order for the area the customer really chose.
+    Returns (lat, lng); either may be None when nothing usable exists.
+    """
+    la, lo = _valid_coordinate(lat, 90), _valid_coordinate(lng, 180)
+    area_lat = getattr(buyer_area, 'latitude', None)
+    area_lng = getattr(buyer_area, 'longitude', None)
+    if buyer_area is None or area_lat is None or area_lng is None:
+        return la, lo  # nothing to compare with (run geocode_coverage_areas to fill area centres)
+
+    centre = (float(area_lat), float(area_lng))
+    if la is None or lo is None:
+        return centre
+    if _haversine_km(la, lo, centre[0], centre[1]) > MAX_AREA_RADIUS_KM:
+        return centre
+    return la, lo
 
 def _calculate_distance_delivery_fee(vendor_lat, vendor_lng, customer_lat, customer_lng) -> Decimal:
     """Computes the delivery fee from live LogisticsPricingConfig records."""
