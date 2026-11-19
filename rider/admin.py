@@ -97,7 +97,7 @@ class RiderProfileAdmin(admin.ModelAdmin):
         'guarantor_passport_preview',
     )
     autocomplete_fields = ('user',)
-    inlines = [RiderPaymentAccountInline, RiderWalletInline]
+    inlines = [RiderPaymentAccountInline, RiderWalletInline, RiderTransactionLedgerInline]
     ordering = ('first_name', 'last_name')
     actions = [
         'vet_and_verify_riders',
@@ -339,7 +339,7 @@ class RiderWalletAdmin(admin.ModelAdmin):
     search_fields = ('rider__first_name', 'rider__last_name', 'rider__bike_plate_number', 'rider__user__email')
     readonly_fields = ('updated_at',)
     autocomplete_fields = ('rider',)
-    inlines = [RiderTransactionLedgerInline]
+    # inlines = [RiderTransactionLedgerInline]
     ordering = ('-updated_at',)
 
 
