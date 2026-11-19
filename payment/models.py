@@ -181,4 +181,67 @@ class VendorSubscription(models.Model):
 
         current_product_count = self.vendor_profile.products.count()
         return current_product_count < self.plan.max_products
-    
+
+    @property
+    def days_until_expiry(self):
+        """Returns remaining full/fractional days until subscription expires, or None if unset."""
+        if not self.subscription_expires_at:
+            return None
+        delta = self.subscription_expires_at - timezone.now()
+        return max(0.0, delta.total_seconds() / 86400)
+
+    @property
+    def is_expiring_soon(self):
+        """True when subscription is active and expires within the next 7 days."""
+        if not self.has_valid_access or not self.subscription_expires_at:
+            return False
+        return self.subscription_expires_at <= timezone.now() + timedelta(days=7)
+
+    @property
+    def is_order_limit_low(self):
+        """True when a capped plan has 10 or fewer remaining orders (or <= 10% left)."""
+        rem = self.remaining_orders
+        if rem is None or not self.plan or not self.plan.max_monthly_orders:
+            return False
+        threshold = max(1, int(self.plan.max_monthly_orders * 0.1))
+        return rem <= min(10, threshold)
+
+    def activate_plan(self, plan, days=30):
+        """Activates or renews a subscription plan cleanly."""
+        now = timezone.now()
+        base_time = (
+            self.subscription_expires_at
+            if self.is_active and self.subscription_expires_at and self.subscription_expires_at > now
+            else now
+        )
+        self.plan = plan
+        self.is_active = True
+        self.subscription_expires_at = base_time + timedelta(days=days)
+        self.save(update_fields=['plan', 'is_active', 'subscription_expires_at'])
+
+
+class SubscriptionReminderLog(models.Model):
+    class ReminderType(models.TextChoices):
+        EXPIRING_7_DAYS = 'expiring_7_days', 'Expiring in 7 days'
+        EXPIRING_3_DAYS = 'expiring_3_days', 'Expiring in 3 days'
+        EXPIRING_1_DAY = 'expiring_1_day', 'Expiring in 1 day'
+        EXPIRED = 'expired', 'Subscription expired'
+        ORDER_LIMIT_LOW = 'order_limit_low', 'Order limit nearly reached'
+        UNUSED_AD_BOOST = 'unused_ad_boost', 'Unused ad boost available'
+
+    subscription = models.ForeignKey(
+        'VendorSubscription',
+        on_delete=models.CASCADE,
+        related_name='reminder_logs',
+    )
+    reminder_type = models.CharField(max_length=32, choices=ReminderType.choices)
+    cycle_expires_at = models.DateTimeField()
+    sent_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['subscription', 'reminder_type', 'cycle_expires_at'],
+                name='unique_subscription_reminder_per_cycle',
+            )
+        ]

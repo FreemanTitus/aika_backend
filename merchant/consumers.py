@@ -90,3 +90,13 @@ class VendorNotificationConsumer(AsyncWebsocketConsumer):
             "audience": message.get("audience"),
             "created_at": message.get("created_at"),
         }))
+
+    async def subscription_reminder(self, event):
+        await self.send_json({
+            "type": "subscription_reminder",
+            "reminder_type": event["reminder_type"],
+            "title": event["title"],
+            "message": event["message"],
+            "expires_at": event["expires_at"],
+            "url": event["url"],
+        })
