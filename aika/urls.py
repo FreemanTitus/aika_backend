@@ -55,7 +55,7 @@ api.add_router("cart/", cart_router)
 
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
+    path('adminPanel/', admin.site.urls),
     path('api/v1/', api.urls),
     path('webpush/', include('webpush.urls')),  # the frontend posts push subscriptions here
 ]

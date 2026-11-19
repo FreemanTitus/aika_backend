@@ -77,6 +77,7 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'ninja.compatibility.files.fix_request_files_middleware',
 
+    'accounts.middleware.JWTUserForWebpushMiddleware',
     'accounts.middleware.PlatformSecurityMiddleware',
 ]
 
@@ -86,20 +87,60 @@ if DEBUG:
     INSTALLED_APPS += ["silk"]
     MIDDLEWARE += ['silk.middleware.SilkyMiddleware']
 
+    # FRONTEND_URL = "http://172.20.10.4:8000"
+    FRONTEND_URL = "http://localhost:3000"
+
+    BACKEND_URL = "http://localhost:8000"
+
+    # BACKEND_URL = "http://172.20.10.4:8000"
+
+    CSRF_TRUSTED_ORIGINS = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://[::1]:3000",
+        "http://172.20.10.4:8000",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000"
+    ]
+
+    CORS_ALLOW_CREDENTIALS = True
+
+    USE_X_FORWARDED_HOST = True
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+    # List your specific frontend domains explicitly
+    CORS_ALLOWED_ORIGINS = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://172.20.10.4:8000",
+        "http://[::1]:3000",
+        "http://10.136.16.114:8000",
+    ]
+
 # FRONTEND_URL = "http://172.20.10.4:8000"
-FRONTEND_URL = "http://localhost:3000"
+FRONTEND_URL = "https://www.useaika.ng"
 
-BACKEND_URL = "http://localhost:8000"
+BACKEND_URL = "https://www.useaika.ng"
 
-# BACKEND_URL = "http://172.20.10.4:8000"
+ALLOWED_HOSTS = [
+    "www.useaika.ng",
+    "useaika.ng",
+    "www.useaika.com.ng",
+    "useaika.com.ng",
+    "102.203.117.148",
+    "localhost",
+    "127.0.0.1",
+]
 
 CSRF_TRUSTED_ORIGINS = [
+    "https://www.useaika.ng",
+    "https://useaika.ng",
+    "https://www.useaika.com.ng",
+    "https://useaika.com.ng",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "http://[::1]:3000",
-    "http://172.20.10.4:8000",
-    "http://localhost:8000",
-    "http://127.0.0.1:8000"
 ]
 
 CORS_ALLOW_CREDENTIALS = True
@@ -109,13 +150,12 @@ SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 # List your specific frontend domains explicitly
 CORS_ALLOWED_ORIGINS = [
+    "https://www.useaika.ng",
+    "https://useaika.ng",
+    "https://www.useaika.com.ng",
+    "https://useaika.com.ng",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "http://localhost:8000",
-    "http://127.0.0.1:8000",
-    "http://172.20.10.4:8000",
-    "http://[::1]:3000",
-    "http://10.136.16.114:8000",
 ]
 
 # Allow standard headers and methods
