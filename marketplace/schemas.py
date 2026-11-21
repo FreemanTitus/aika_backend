@@ -26,7 +26,7 @@ class QuoteRequestSchema(Schema):
     merchant_id: str
     address_id: Optional[int] = None
     street_address: Optional[str] = None
-    # base_location: Optional[int, str] = None
+    base_location: Optional[str] = None
 
 class CategoryFilterSchema(Schema):
     category: Optional[str] = None
@@ -38,6 +38,7 @@ class SubCategoryFilterSchema(Schema):
 # You can use this plain Schema block directly in your view like: `filters: StorefrontFilters = Query(...)`
 class StorefrontFilters(Schema):
     """Parses optional URL query strings like ?subcategory=5 cleanly at the gateway layer."""
+    category: str | None = None
     subcategory: Optional[str] = None
 
 

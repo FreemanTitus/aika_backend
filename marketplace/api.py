@@ -6,7 +6,7 @@ from typing import Optional
 
 from asgiref.sync import sync_to_async
 from django.db import transaction
-from django.db.models import F, Prefetch, Q
+from django.db.models import F, Prefetch, Q, Exists, OuterRef
 from django.http import Http404, HttpResponse
 from django.template.loader import render_to_string
 from django.utils import timezone
@@ -104,15 +104,18 @@ async def _confirm_and_finalize(order_obj) -> bool:
 # 1. GET ALL VENDORS
 # =========================================================================
 @router.get("/vendors")
-def get_marketplace_vendors_api(request, customer_location_id: Optional[int] = None):
+def get_marketplace_vendors_api(
+    request,
+    customer_location_id: Optional[int] = None,
+    category: Optional[str] = None,
+):
     """
-    Retrieves marketplace vendors. 
+    Retrieves marketplace vendors.
     Restaurants are restricted strictly to the customer's selected base location hub.
     E-commerce and other businesses remain globally visible.
     """
     now = timezone.now()
-    
-    # If customer_location_id is not passed as query param, try getting it from authenticated user
+
     if not customer_location_id and request.user and request.user.is_authenticated:
         if hasattr(request.user, 'base_location_id'):
             customer_location_id = request.user.base_location_id
@@ -123,16 +126,18 @@ def get_marketplace_vendors_api(request, customer_location_id: Optional[int] = N
         vendorsubscription__is_active=True,
         vendorsubscription__subscription_expires_at__gt=now
     ).select_related(
-        'user', 
+        'user',
         'user__base_location',
-        'vendorsubscription', 
-        'vendorsubscription__plan', 
+        'vendorsubscription',
+        'vendorsubscription__plan',
         'storefront_config'
     ).order_by(
-        '-vendorsubscription__plan__price', 
-        '-rating', 
+        '-vendorsubscription__plan__price',
+        '-rating',
         '-review_count'
     )
+
+    resolved_cat = _resolve_product_category(category)
 
     restaurants = []
     e_commerce = []
@@ -141,7 +146,7 @@ def get_marketplace_vendors_api(request, customer_location_id: Optional[int] = N
     for vendor in query_set:
         vendor_loc_id = vendor.user.base_location_id if (vendor.user and vendor.user.base_location) else None
         base_loc = str(vendor.user.base_location.name) if (vendor.user and vendor.user.base_location) else ''
-        
+
         active_sub = getattr(vendor, 'vendorsubscription', None)
         plan_name = active_sub.plan.name if active_sub and active_sub.plan else 'Standard'
         plan_price = float(active_sub.plan.price) if active_sub and active_sub.plan else 0.0
@@ -175,17 +180,16 @@ def get_marketplace_vendors_api(request, customer_location_id: Optional[int] = N
         b_type = str(vendor.business_type).lower().strip()
 
         if b_type in ['restaurant']:
-            # --- RESTAURANT GEOFENCING LOGIC ---
-            # Only include restaurant if customer location matches the vendor's hub location
             if customer_location_id is not None:
                 if vendor_loc_id == int(customer_location_id):
                     restaurants.append(vendor_data)
             else:
-                # Fallback: if no location is selected yet, optionally show local default or skip
-                # (You can choose to include all or none until they pick a hub)
                 restaurants.append(vendor_data)
         elif b_type in ['ecommerce', 'e_commerce', 'general']:
-            # --- E-COMMERCE: GLOBAL VISIBILITY ---
+            if resolved_cat:
+                vendor_cat = str(vendor.ecommerce_sub_category or '').strip().lower()
+                if vendor_cat != resolved_cat:
+                    continue
             e_commerce.append(vendor_data)
         else:
             other_businesses.append(vendor_data)
@@ -203,6 +207,40 @@ def get_marketplace_vendors_api(request, customer_location_id: Optional[int] = N
 # =========================================================================
 # 2. GET VENDOR STOREFRONT DETAILS
 # =========================================================================
+
+
+def _resolve_product_category(category_param: str | None) -> str | None:
+    """Normalizes a category slug or display label into Product.CategoryChoices value."""
+    if not category_param:
+        return None
+
+    raw_cat = category_param.strip().lower()
+    if not raw_cat or raw_cat in {"ecommerce", "e_commerce", "all"}:
+        return None
+
+    display_to_choice = {
+        label.lower(): value
+        for value, label in Product.CategoryChoices.choices
+    }
+    return display_to_choice.get(raw_cat, raw_cat)
+
+
+def filter_ecommerce_vendors_by_category(queryset, category_param: str | None):
+    """Filters an e-commerce MerchantProfile queryset to vendors with available products in category."""
+    resolved_cat = _resolve_product_category(category_param)
+    if not resolved_cat:
+        return queryset
+
+    matching_products = Product.objects.filter(
+        vendor_id=OuterRef("pk"),
+        is_available=True,
+        category__iexact=resolved_cat,
+    )
+    return queryset.annotate(has_matching_category=Exists(matching_products)).filter(
+        has_matching_category=True
+    )
+
+
 @router.get("/vendor/{vendor_id}")
 def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilters = Query(...)):
     """
@@ -210,8 +248,9 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
     Intelligently branches data structures for E-Commerce and Restaurant clients.
     """
     try:
-        # Include 'user__base_location' to prevent lazy-loading database lookups
-        vendor = MerchantProfile.objects.select_related('user', 'user__base_location').get(id=vendor_id, is_approved=True)
+        vendor = MerchantProfile.objects.select_related(
+            'user', 'user__base_location'
+        ).get(id=vendor_id, is_approved=True)
     except MerchantProfile.DoesNotExist:
         raise HttpError(404, "Approved vendor profile not found.")
 
@@ -228,7 +267,7 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
             last_order_ref = last_order.order_reference or ''
 
     total_reviews = vendor.review_count if (vendor.review_count and vendor.review_count > 0) else 1
-    
+
     ratings_matrix = {
         "rating_5_percentage": int(((vendor.count_5_stars or 0) / total_reviews) * 100),
         "rating_4_percentage": int(((vendor.count_4_stars or 0) / total_reviews) * 100),
@@ -238,7 +277,9 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
     }
 
     reviews_list = []
-    reviews_query = vendor.reviews.select_related('customer', 'customer__individual_profile').order_by('-created_at')[:15]
+    reviews_query = vendor.reviews.select_related(
+        'customer', 'customer__individual_profile'
+    ).order_by('-created_at')[:15]
     for review in reviews_query:
         profile = getattr(review.customer, 'individual_profile', None)
         first = (getattr(profile, 'first_name', '') or '').strip()
@@ -250,13 +291,15 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
             "rating": review.rating,
             "comment": review.comment,
             "customer_name": customer_name,
-            "created_at": review.created_at.isoformat()
+            "created_at": review.created_at.isoformat(),
         })
 
-    # Safely extract base location name
-    base_loc_name = str(vendor.user.base_location.name) if (vendor.user and vendor.user.base_location) else ''
+    base_loc_name = (
+        str(vendor.user.base_location.name)
+        if (vendor.user and vendor.user.base_location)
+        else ''
+    )
 
-    # Get or create storefront config universally for all business types so hero_image always works
     storefront_config, _ = StorefrontConfig.objects.get_or_create(profile=vendor)
 
     base_data = {
@@ -277,7 +320,7 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
             "brand_bio": storefront_config.brand_bio,
             "instagram_handle": storefront_config.instagram_handle,
             "twitter_handle": storefront_config.twitter_handle,
-        }
+        },
     }
 
     product_query = vendor.products.filter(is_available=True).select_related('sub_category', 'brand')
@@ -286,8 +329,14 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
     # BRANCH A: E-COMMERCE RETAIL LOGIC
     # -------------------------------------------------------------------------
     if vendor.business_type == 'e_commerce':
-        if filters.subcategory:
-            product_query = product_query.filter(sub_category__name__iexact=filters.subcategory)
+        resolved_cat = _resolve_product_category(getattr(filters, 'category', None))
+        if resolved_cat:
+            product_query = product_query.filter(category__iexact=resolved_cat)
+
+        if getattr(filters, 'subcategory', None):
+            product_query = product_query.filter(
+                sub_category__name__iexact=filters.subcategory.strip()
+            )
 
         products_list = []
         for product in product_query:
@@ -299,14 +348,33 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
                 "image": product.image.url if product.image else None,
                 "current_price": float(product.current_price),
                 "bonanza_mode": product.bonanza_mode,
-                "discount_percentage": product.discount_percentage,
+                "discount_percentage": getattr(product, 'discount_percentage', None),
+                "category": product.category,
+                "category_label": product.get_category_display(),
                 "brand_name": product.brand.name if product.brand else None,
-                "sub_category_name": product.sub_category.name if product.sub_category else None
+                "sub_category_name": product.sub_category.name if product.sub_category else None,
             })
 
+        # Distinct product categories (e.g. gadgets, apparel, appliances, beauty) this vendor carries
+        available_categories = []
+        seen_cat_keys = set()
+        cat_query = (
+            vendor.products.filter(is_available=True)
+            .values_list('category', flat=True)
+            .distinct()
+        )
+        choice_labels = dict(Product.CategoryChoices.choices)
+        for cat_key in cat_query:
+            if cat_key and cat_key not in seen_cat_keys:
+                seen_cat_keys.add(cat_key)
+                available_categories.append({
+                    "key": cat_key,
+                    "label": choice_labels.get(cat_key, str(cat_key).replace('_', ' ').title()),
+                })
+
+        # Subcategories (e.g. Laptops, Chargers) for product filtering in the storefront
         categories_sidebar = []
         seen_subcat_ids = set()
-        
         sidebar_query = (
             vendor.products.filter(is_available=True, sub_category__isnull=False)
             .order_by('sub_category__name')
@@ -318,9 +386,10 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
                 seen_subcat_ids.add(sub_id)
                 categories_sidebar.append({
                     "id": sub_id,
-                    "name": cat['sub_category__name']
+                    "name": cat['sub_category__name'],
                 })
 
+        base_data["available_categories"] = available_categories
         base_data["sidebar_categories"] = categories_sidebar
         base_data["products"] = products_list
 
@@ -328,8 +397,10 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
     # BRANCH B: NESTED RESTAURANT MENU ENGINE LOGIC
     # -------------------------------------------------------------------------
     else:
-        if filters.subcategory:
-            product_query = product_query.filter(sub_category__name__iexact=filters.subcategory)
+        if getattr(filters, 'subcategory', None):
+            product_query = product_query.filter(
+                sub_category__name__iexact=filters.subcategory.strip()
+            )
 
         available_options_prefetch = Prefetch(
             'menu_options',
@@ -340,24 +411,25 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
 
         categories_dict = {}
         for product in product_query:
-            category_name = "General Items"
             if product.sub_category and product.sub_category.name:
                 category_name = product.sub_category.name
-            elif hasattr(product, 'category') and product.category:
-                category_name = str(product.category)
-            
-            if category_name not in categories_dict:
-                categories_dict[category_name] = []
+            elif product.category:
+                category_name = product.get_category_display()
+            else:
+                category_name = "General Items"
 
-            menu_options_list = []
-            for option in product.filtered_menu_options:
-                menu_options_list.append({
+            categories_dict.setdefault(category_name, [])
+
+            menu_options_list = [
+                {
                     "id": option.id,
                     "name": option.name,
                     "price": float(option.price),
-                    "is_available": option.is_available
-                })
-                
+                    "is_available": option.is_available,
+                }
+                for option in getattr(product, 'filtered_menu_options', [])
+            ]
+
             categories_dict[category_name].append({
                 "id": product.id,
                 "name": product.name,
@@ -366,8 +438,8 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
                 "image": product.image.url if product.image else None,
                 "current_price": float(product.current_price),
                 "bonanza_mode": product.bonanza_mode,
-                "discount_percentage": product.discount_percentage,
-                "menu_options": menu_options_list
+                "discount_percentage": getattr(product, 'discount_percentage', None),
+                "menu_options": menu_options_list,
             })
 
         base_data["menu_categories"] = categories_dict
@@ -375,7 +447,7 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
     return {
         "status": "success",
         "message": f"Successfully loaded {vendor.company_name}'s store details and reviews.",
-        "data": base_data
+        "data": base_data,
     }
 
 @router.get("/recommended-vendors")
