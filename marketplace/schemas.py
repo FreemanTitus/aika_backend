@@ -26,6 +26,7 @@ class QuoteRequestSchema(Schema):
     merchant_id: str
     address_id: Optional[int] = None
     street_address: Optional[str] = None
+    # base_location: Optional[int, str] = None
 
 class CategoryFilterSchema(Schema):
     category: Optional[str] = None

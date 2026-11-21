@@ -1066,8 +1066,22 @@ def quote_delivery_fee_api(request, vendor_id: str, data: QuoteRequestInput):
         .first()
     )
 
+    profile_user = getattr(customer_profile, "user", None) if customer_profile else None
+    user_base_location = (
+        getattr(user, "base_location", None)
+        or getattr(profile_user, "base_location", None)
+    )
+    requested_base_location = getattr(data, "base_location", None)
+    effective_base_location = (
+        requested_base_location
+        if requested_base_location not in (None, "")
+        else user_base_location
+    )
+
     try:
-        mode, vendor_fee = decide_fulfillment(vendor, customer_profile, data.base_location)
+        mode, vendor_fee = decide_fulfillment(
+            vendor, customer_profile, effective_base_location
+        )
     except AreaRequiredError as exc:
         # The UI asks the customer to pick an area, then asks for the quote again.
         return {
@@ -1111,7 +1125,7 @@ def quote_delivery_fee_api(request, vendor_id: str, data: QuoteRequestInput):
     quote_lat, quote_lng = sanitize_customer_coordinates(
         data.latitude,
         data.longitude,
-        _resolve_buyer_area(data.base_location, customer_profile),
+        _resolve_buyer_area(effective_base_location, customer_profile),
     )
 
     delivery_fee = _calculate_distance_delivery_fee(
