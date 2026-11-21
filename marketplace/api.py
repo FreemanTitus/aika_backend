@@ -204,6 +204,131 @@ def get_marketplace_vendors_api(
         }
     }
 
+
+@router.get("/products")
+def get_marketplace_products_api(
+    request,
+    customer_location_id: Optional[int] = None,
+    business_type: Optional[str] = None,
+    category: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 36,
+):
+    """
+    Retrieves available products/dishes across active, subscribed merchants.
+    Applies restaurant location geofencing and optional category/search filters.
+    """
+    now = timezone.now()
+
+    if not customer_location_id and request.user and request.user.is_authenticated:
+        if hasattr(request.user, "base_location_id"):
+            customer_location_id = request.user.base_location_id
+
+    products_qs = (
+        Product.objects.filter(
+            is_available=True,
+            vendor__is_approved=True,
+            vendor__is_active_store=True,
+            vendor__vendorsubscription__is_active=True,
+            vendor__vendorsubscription__subscription_expires_at__gt=now,
+        )
+        .select_related(
+            "vendor",
+            "vendor__user",
+            "vendor__user__base_location",
+            "vendor__storefront_config",
+            "sub_category",
+            "brand",
+        )
+        .order_by("-vendor__vendorsubscription__plan__price", "-vendor__rating", "name")
+    )
+
+    # Filter by marketplace tab / business type if specified
+    if business_type:
+        b_type = business_type.strip().lower()
+        if b_type in {"restaurants", "restaurant"}:
+            products_qs = products_qs.filter(vendor__business_type="restaurant")
+        elif b_type in {"ecommerce", "e_commerce", "general"}:
+            products_qs = products_qs.filter(
+                vendor__business_type__in=["e_commerce", "ecommerce", "general"]
+            )
+        elif b_type in {"others", "other", "services"}:
+            products_qs = products_qs.exclude(
+                vendor__business_type__in=["restaurant", "e_commerce", "ecommerce", "general"]
+            )
+
+    # Filter e-commerce products by resolved category (e.g. gadgets, apparel, appliances, beauty)
+    resolved_cat = _resolve_product_category(category)
+    if resolved_cat:
+        products_qs = products_qs.filter(category__iexact=resolved_cat)
+
+    # Text search across product name, description, brand, subcategory, or vendor name
+    if q and q.strip():
+        term = q.strip()
+        products_qs = products_qs.filter(
+            Q(name__icontains=term)
+            | Q(description__icontains=term)
+            | Q(vendor__company_name__icontains=term)
+            | Q(sub_category__name__icontains=term)
+            | Q(brand__name__icontains=term)
+        )
+
+    items = []
+    for product in products_qs:
+        vendor = product.vendor
+        vendor_loc_id = (
+            vendor.user.base_location_id
+            if (vendor.user and vendor.user.base_location)
+            else None
+        )
+
+        # Enforce hub geofencing on restaurant items
+        if str(vendor.business_type).lower().strip() == "restaurant":
+            if customer_location_id is not None and vendor_loc_id != int(customer_location_id):
+                continue
+
+        storefront = getattr(vendor, "storefront_config", None)
+        store_slug = storefront.store_slug if storefront else None
+
+        items.append({
+            "id": product.id,
+            "name": product.name,
+            "description": product.description,
+            "price": float(product.price),
+            "current_price": float(product.current_price),
+            "bonanza_mode": product.bonanza_mode,
+            "discount_percentage": getattr(product, "discount_percentage", None),
+            "image": product.image.url if product.image else None,
+            "category": product.category,
+            "category_label": product.get_category_display(),
+            "sub_category_name": product.sub_category.name if product.sub_category else None,
+            "brand_name": product.brand.name if product.brand else None,
+            "vendor": {
+                "id": vendor.id,
+                "company_name": vendor.company_name,
+                "business_type": vendor.business_type,
+                "store_slug": store_slug,
+                "is_currently_open": getattr(vendor, "is_currently_open", True),
+                "rating": float(vendor.rating) if vendor.rating else 0.0,
+                "location_name": (
+                    str(vendor.user.base_location.name)
+                    if (vendor.user and vendor.user.base_location)
+                    else ""
+                ),
+            },
+        })
+
+        if len(items) >= max(1, min(limit, 100)):
+            break
+
+    return {
+        "status": "success",
+        "message": "Marketplace products retrieved successfully.",
+        "data": {
+            "items": items,
+            "count": len(items),
+        },
+    }
 # =========================================================================
 # 2. GET VENDOR STOREFRONT DETAILS
 # =========================================================================
