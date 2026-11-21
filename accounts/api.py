@@ -457,10 +457,13 @@ def login_user_api(request, data: UserLoginSchema):
 
     # Dashboard redirection assignments
     redirect_target = "/customer/dashboard"
-    if user.is_superuser:
+
+    if user.is_superuser or user.Role.ADMIN:
         redirect_target = "/admin/dashboard"
     elif user.role == CustomUser.Role.STAFF:
         redirect_target = "/staff/dashboard"
+    elif user.role == CustomUser.Role.AGENT:
+        redirect_target = "/agent/dashboard"
     elif user.role == CustomUser.Role.AGENT:
         redirect_target = "/agent/dashboard"
     elif user.role == CustomUser.Role.BUSINESS:

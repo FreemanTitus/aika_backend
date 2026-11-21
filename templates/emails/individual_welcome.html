@@ -1,117 +1,170 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <title>Welcome to Aika</title>
 </head>
-<body style="margin: 0; padding: 0; background-color: #ffffff; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
-    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color: #ffffff; padding: 30px 15px;">
-        <tr><td align="center">
-            <table border="0" cellpadding="0" cellspacing="0" width="600" style="background-color: #ffffff; text-align: left;">
-                
-                <!-- Header -->
-                <tr><td style="padding-bottom: 20px;">
+<body style="margin: 0; padding: 0; background-color: #F1F5F9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased;">
+  <!-- Hidden Preheader Text -->
+  <div style="display: none; max-height: 0; overflow: hidden; mso-hide: all;">
+    Welcome to Aika, {{ user_name }}! Your customer account is ready — explore local stores, hot meals, and instant dispatch.
+  </div>
+
+  <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color: #F1F5F9; padding: 32px 16px;">
+    <tr>
+      <td align="center">
+        <!-- Main Email Card -->
+        <table border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 600px; background-color: #FFFFFF; border-radius: 24px; overflow: hidden; border: 1px solid #E2E8F0; box-shadow: 0 10px 25px -5px rgba(10, 17, 40, 0.06); text-align: left;">
+          <tr>
+            <td style="padding: 32px 36px 36px 36px;">
+              <table border="0" cellpadding="0" cellspacing="0" width="100%">
+
+                <!-- Original Header -->
+                <tr>
+                  <td style="padding-bottom: 20px;">
                     <table border="0" cellpadding="0" cellspacing="0" width="100%">
-                        <tr>
-                            <td align="left"><span style="font-size: 18px; font-weight: 900; color: #0A1128; text-transform: uppercase;">[ Aika ]</span></td>
-                            <td align="right" style="font-size: 12px; font-weight: 800; text-transform: uppercase; color: #0A1128;">Customer Hub</td>
-                        </tr>
+                      <tr>
+                        <td align="left"><span style="font-size: 18px; font-weight: 900; color: #0A1128; text-transform: uppercase;">[ Aika ]</span></td>
+                        <td align="right" style="font-size: 12px; font-weight: 800; text-transform: uppercase; color: #0A1128;">Customer Hub</td>
+                      </tr>
                     </table>
-                </td></tr>
+                  </td>
+                </tr>
 
-                <!-- Gradient Accent Bar -->
-                <tr><td style="height: 6px; background: linear-gradient(90deg, #0A1128 0%, #84cc16 50%, #D4F53C 100%); border-radius: 4px;"></td></tr>
+                <!-- Original Gradient Accent Bar -->
+                <tr>
+                  <td style="height: 6px; background-color: #84cc16; background: linear-gradient(90deg, #0A1128 0%, #84cc16 50%, #D4F53C 100%); border-radius: 4px; font-size: 0; line-height: 0;">&nbsp;</td>
+                </tr>
 
-                <!-- Subtitle -->
-                <tr><td style="padding-top: 35px; padding-bottom: 12px; color: #84cc16; font-size: 13px; font-weight: 800; text-transform: uppercase;">Account Created</td></tr>
+                <!-- Status Pill -->
+                <tr>
+                  <td style="padding-top: 32px; padding-bottom: 14px;">
+                    <span style="display: inline-block; background-color: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 999px; padding: 5px 14px; font-size: 11px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; color: #15803D;">
+                      &#10003;&nbsp; Account Created
+                    </span>
+                  </td>
+                </tr>
 
                 <!-- Main Subject Heading -->
-                <tr><td style="padding-bottom: 24px;"><h1 style="color: #0A1128; font-size: 32px; font-weight: 900; margin: 0; line-height: 1.2;">Welcome to Aika, {{ user_name }}!</h1></td></tr>
+                <tr>
+                  <td style="padding-bottom: 14px;">
+                    <h1 style="color: #0A1128; font-size: 28px; font-weight: 900; margin: 0; line-height: 1.25; letter-spacing: -0.02em;">
+                      Welcome to Aika, {{ user_name }}!
+                    </h1>
+                  </td>
+                </tr>
 
                 <!-- Content Body -->
-                <tr><td style="color: #1f2937; font-size: 16px; line-height: 1.7; padding-bottom: 30px;">
-                    Your individual account has been successfully created. You can now explore verified local stores, gourmet kitchens, and book instantaneous cross-town rides or package deliveries right from your dashboard.
-                </td></tr>
+                <tr>
+                  <td style="color: #334155; font-size: 15px; line-height: 1.7; padding-bottom: 26px;">
+                    Your account is live and ready to use. Explore verified local stores, order fresh meals from nearby kitchens, or book instant rides and package deliveries right from your dashboard.
+                  </td>
+                </tr>
 
                 <!-- Quick Features Callout Box -->
                 <tr>
-                    <td style="background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 20px; padding: 25px; padding-bottom: 25px;">
-                        <table border="0" cellpadding="0" cellspacing="0" width="100%">
+                  <td style="padding-bottom: 28px;">
+                    <table border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 18px;">
+                      <tr>
+                        <td style="padding: 22px 22px 24px 22px;">
+                          <table border="0" cellpadding="0" cellspacing="0" width="100%">
                             <tr>
-                                <td style="font-size: 14px; font-weight: 900; color: #0A1128; padding-bottom: 16px;">
-                                    What you can do right now:
-                                </td>
+                              <td style="font-size: 12px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.06em; color: #0A1128; padding-bottom: 16px;">
+                                What You Can Do Right Now
+                              </td>
                             </tr>
-                            
+
                             <!-- Feature 1: Marketplace -->
                             <tr>
-                                <td style="padding-bottom: 14px;">
-                                    <table border="0" cellpadding="0" cellspacing="0">
-                                        <tr>
-                                            <td width="28" valign="middle">
-                                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0A1128" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2L3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"></path><line x1="3" y1="6" x2="21" y2="6"></line><path d="M16 10a4 4 0 0 1-8 0"></path></svg>
-                                            </td>
-                                            <td style="font-size: 14px; color: #4B5563; line-height: 1.5;">
-                                                <strong style="color: #0A1128;">Marketplace:</strong> Order food items and retail goods from verified vendors.
-                                            </td>
-                                        </tr>
-                                    </table>
-                                </td>
+                              <td style="padding-bottom: 14px;">
+                                <table border="0" cellpadding="0" cellspacing="0" width="100%">
+                                  <tr>
+                                    <td width="40" valign="top">
+                                      <span style="display: inline-block; width: 28px; height: 28px; line-height: 28px; text-align: center; background-color: #0A1128; color: #D4F53C; font-size: 13px; font-weight: 900; border-radius: 8px;">
+                                        &#128717;
+                                      </span>
+                                    </td>
+                                    <td valign="top" style="font-size: 14px; color: #475569; line-height: 1.55;">
+                                      <strong style="color: #0A1128;">Marketplace:</strong> Order meals, groceries, and retail goods from verified local storefronts.
+                                    </td>
+                                  </tr>
+                                </table>
+                              </td>
                             </tr>
 
                             <!-- Feature 2: Transit Loops -->
                             <tr>
-                                <td style="padding-bottom: 14px;">
-                                    <table border="0" cellpadding="0" cellspacing="0">
-                                        <tr>
-                                            <td width="28" valign="middle">
-                                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0A1128" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18.5" cy="17.5" r="3.5"></circle><circle cx="5.5" cy="17.5" r="3.5"></circle><circle cx="15" cy="5" r="1"></circle><path d="M12 17.5V14l-3-3 4-3 2 3h2"></path></svg>
-                                            </td>
-                                            <td style="font-size: 14px; color: #4B5563; line-height: 1.5;">
-                                                <strong style="color: #0A1128;">Transit Loops:</strong> Request a motorcycle ride across town instantly.
-                                            </td>
-                                        </tr>
-                                    </table>
-                                </td>
+                              <td style="padding-bottom: 14px;">
+                                <table border="0" cellpadding="0" cellspacing="0" width="100%">
+                                  <tr>
+                                    <td width="40" valign="top">
+                                      <span style="display: inline-block; width: 28px; height: 28px; line-height: 28px; text-align: center; background-color: #0A1128; color: #D4F53C; font-size: 13px; font-weight: 900; border-radius: 8px;">
+                                        &#127949;
+                                      </span>
+                                    </td>
+                                    <td valign="top" style="font-size: 14px; color: #475569; line-height: 1.55;">
+                                      <strong style="color: #0A1128;">Transit Loops:</strong> Request a fast, reliable motorcycle ride across town in seconds.
+                                    </td>
+                                  </tr>
+                                </table>
+                              </td>
                             </tr>
 
                             <!-- Feature 3: Package Delivery -->
                             <tr>
-                                <td>
-                                    <table border="0" cellpadding="0" cellspacing="0">
-                                        <tr>
-                                            <td width="28" valign="middle">
-                                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#0A1128" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="16.5" y1="9.4" x2="7.5" y2="4.21"></line><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
-                                            </td>
-                                            <td style="font-size: 14px; color: #4B5563; line-height: 1.5;">
-                                                <strong style="color: #0A1128;">Package Delivery:</strong> Send parcels or run errands with live rider tracking.
-                                            </td>
-                                        </tr>
-                                    </table>
-                                </td>
+                              <td>
+                                <table border="0" cellpadding="0" cellspacing="0" width="100%">
+                                  <tr>
+                                    <td width="40" valign="top">
+                                      <span style="display: inline-block; width: 28px; height: 28px; line-height: 28px; text-align: center; background-color: #0A1128; color: #D4F53C; font-size: 13px; font-weight: 900; border-radius: 8px;">
+                                        &#128230;
+                                      </span>
+                                    </td>
+                                    <td valign="top" style="font-size: 14px; color: #475569; line-height: 1.55;">
+                                      <strong style="color: #0A1128;">Package Delivery:</strong> Send parcels or run errands with live, real-time rider tracking.
+                                    </td>
+                                  </tr>
+                                </table>
+                              </td>
                             </tr>
 
-                        </table>
-                    </td>
+                          </table>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+
+                <!-- Primary CTA Button -->
+                <tr>
+                  <td style="padding-bottom: 32px;">
+                    <a href="https://useaika.ng/marketplace" style="display: inline-block; background-color: #0A1128; color: #D4F53C; font-size: 13px; font-weight: 800; text-decoration: none; padding: 14px 26px; border-radius: 12px; letter-spacing: 0.02em;">
+                      Explore Marketplace &rarr;
+                    </a>
+                  </td>
                 </tr>
 
                 <!-- Footer Divider & Meta -->
-                <tr><td style="border-top: 1px solid #e5e7eb; padding-top: 30px; text-align: center;">
-                    <p style="margin: 0 0 8px 0; color: #6b7280; font-size: 12px; line-height: 1.5;">
-                        Need assistance? Reach out to our support team at 
-                        <a href="mailto:support@useaila.ng" 
-                        style="color: #0A1128; font-weight: 700; 
-                        text-decoration: none;"
-                    >support@useaika.ng</a>
-                    </p>s
-                    <p style="margin: 12px 0 0 0; color: #9ca3af; font-size: 11px;">
-                        &copy; 2026 Aika. A Product of Techforge Global LTD. All rights reserved.
+                <tr>
+                  <td style="border-top: 1px solid #E2E8F0; padding-top: 24px; text-align: center;">
+                    <p style="margin: 0 0 8px 0; color: #64748B; font-size: 12px; line-height: 1.5;">
+                      Need assistance? Reach out to our support team at
+                      <a href="mailto:support@useaika.ng" style="color: #0A1128; font-weight: 800; text-decoration: none;">support@useaika.ng</a>
                     </p>
-                </td></tr>
+                    <p style="margin: 8px 0 0 0; color: #94A3B8; font-size: 11px;">
+                      &copy; 2026 Aika. A Product of Techforge Global LTD. All rights reserved.
+                    </p>
+                  </td>
+                </tr>
 
-            </table>
-        </td></tr>
-    </table>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
 </body>
 </html>
