@@ -822,11 +822,17 @@ def _sync_atomic_order_writer(customer_profile, vendor, input_data):
             # The vendor delivers and sets its own charge (0 = free delivery).
             delivery_charge = Decimal(self_delivery_fee or 0)
         else:
-            vendor_user = getattr(vendor, 'user', None)
-            vendor_lat = getattr(vendor, 'latitude', None) or getattr(vendor_user, 'latitude', None)
-            vendor_lng = getattr(vendor, 'longitude', None) or getattr(vendor_user, 'longitude', None)
-            customer_lat = input_data.latitude or getattr(customer_profile, 'latitude', None)
-            customer_lng = input_data.longitude or getattr(customer_profile, 'longitude', None)
+            vendor_user = getattr(vendor, "user", None)
+            vendor_lat = getattr(vendor, "latitude", None)
+            if vendor_lat is None and vendor_user is not None:
+                vendor_lat = getattr(vendor_user, "latitude", None)
+
+            vendor_lng = getattr(vendor, "longitude", None)
+            if vendor_lng is None and vendor_user is not None:
+                vendor_lng = getattr(vendor_user, "longitude", None)
+
+            customer_lat = input_data.latitude if input_data.latitude is not None else getattr(customer_profile, "latitude", None)
+            customer_lng = input_data.longitude if input_data.longitude is not None else getattr(customer_profile, "longitude", None)
             # Never trust device coordinates blindly: they must fall inside the chosen delivery area.
             customer_lat, customer_lng = sanitize_customer_coordinates(
                 customer_lat, customer_lng,
@@ -1043,17 +1049,22 @@ def quote_delivery_fee_api(request, vendor_id: str, data: QuoteRequestInput):
     user = request.user
     clean_vendor_id = vendor_id.strip()
 
-    vendor = MerchantProfile.objects.select_related(
-        'user', 'user__base_location', 'shipping_preference'
-    ).filter(
-        id__iexact=clean_vendor_id,
-        is_approved=True
-    ).first()
+    vendor = (
+        MerchantProfile.objects.select_related(
+            "user", "user__base_location", "shipping_preference"
+        )
+        .filter(id__iexact=clean_vendor_id, is_approved=True)
+        .first()
+    )
 
     if not vendor:
         raise HttpError(404, "Vendor storefront profile not found or not approved.")
 
-    customer_profile = IndividualProfile.objects.select_related('user', 'user__base_location').filter(user=user).first()
+    customer_profile = (
+        IndividualProfile.objects.select_related("user", "user__base_location")
+        .filter(user=user)
+        .first()
+    )
 
     try:
         mode, vendor_fee = decide_fulfillment(vendor, customer_profile, data.base_location)
@@ -1073,7 +1084,7 @@ def quote_delivery_fee_api(request, vendor_id: str, data: QuoteRequestInput):
         raise HttpError(400, str(exc))
 
     if mode == MarketplaceOrder.FulfillmentMode.VENDOR_SELF_DELIVERY:
-        fee = Decimal(vendor_fee or 0)
+        fee = Decimal(str(vendor_fee or 0))
         return {
             "status": "success",
             "fulfillment_mode": mode,
@@ -1085,22 +1096,29 @@ def quote_delivery_fee_api(request, vendor_id: str, data: QuoteRequestInput):
             "net_delivery_fee": float(fee),
         }
 
-    wallet_balance = Decimal('0.00')
+    wallet_balance = Decimal("0.00")
     if user and not user.is_anonymous:
         try:
             wallet = CustomerWallet.objects.get(user=user, is_active=True)
-            wallet_balance = wallet.balance
+            wallet_balance = Decimal(str(wallet.balance))
         except CustomerWallet.DoesNotExist:
             pass
 
-    vendor_lat = getattr(vendor, 'latitude', None) or (getattr(vendor, 'user', None) and getattr(vendor.user, 'latitude', None)) or ''
-    vendor_lng = getattr(vendor, 'longitude', None) or (getattr(vendor, 'user', None) and getattr(vendor.user, 'longitude', None)) or ''
+    vendor_user = getattr(vendor, "user", None)
+    vendor_lat = getattr(vendor_user, "latitude", None) if vendor_user else None
+    vendor_lng = getattr(vendor_user, "longitude", None) if vendor_user else None
 
     quote_lat, quote_lng = sanitize_customer_coordinates(
-        data.latitude, data.longitude, _resolve_buyer_area(data.base_location, customer_profile)
+        data.latitude,
+        data.longitude,
+        _resolve_buyer_area(data.base_location, customer_profile),
     )
+
     delivery_fee = _calculate_distance_delivery_fee(
-        vendor_lat, vendor_lng, quote_lat or '', quote_lng or ''
+        vendor_lat,
+        vendor_lng,
+        quote_lat,
+        quote_lng,
     )
 
     wallet_applied = min(delivery_fee, wallet_balance)
@@ -1114,7 +1132,7 @@ def quote_delivery_fee_api(request, vendor_id: str, data: QuoteRequestInput):
         "delivery_fee": float(delivery_fee),
         "wallet_balance": float(wallet_balance),
         "wallet_applied_to_delivery": float(wallet_applied),
-        "net_delivery_fee": float(net_delivery_fee)
+        "net_delivery_fee": float(net_delivery_fee),
     }
 
 
@@ -1203,51 +1221,3 @@ async def get_vendor_coordinates_api(request, vendor_id: str):
         },
     }
 
-@router.post("/quote-delivery/{vendor_id}", auth=JWTAuth())
-def quote_delivery_fee_api(request, vendor_id: str, data: QuoteRequestInput):
-    """
-    Synchronously calculates and returns the precise distance-based delivery fee 
-    and available wallet coverage for the authenticated customer.
-    """
-    user = request.user
-    clean_vendor_id = vendor_id.strip()
-
-    # 1. Vendor Lookup
-    vendor = MerchantProfile.objects.select_related('user').filter(
-        id__iexact=clean_vendor_id,
-        is_approved=True
-    ).first()
-
-    if not vendor:
-        raise HttpError(404, "Vendor storefront profile not found or not approved.")
-
-    # 2. Customer Wallet Balance Lookup
-    wallet_balance = Decimal('0.00')
-    if user and not user.is_anonymous:
-        try:
-            wallet = CustomerWallet.objects.get(user=user, is_active=True)
-            wallet_balance = wallet.balance
-        except CustomerWallet.DoesNotExist:
-            pass
-
-    # 3. Extract Coordinates & Calculate Distance Fee Directly
-    vendor_lat = getattr(vendor, 'latitude', None) or (getattr(vendor, 'user', None) and getattr(vendor.user, 'latitude', None)) or ''
-    vendor_lng = getattr(vendor, 'longitude', None) or (getattr(vendor, 'user', None) and getattr(vendor.user, 'longitude', None)) or ''
-    
-    customer_lat = data.latitude or ''
-    customer_lng = data.longitude or ''
-
-    delivery_fee = _calculate_distance_delivery_fee(
-        vendor_lat, vendor_lng, customer_lat, customer_lng
-    )
-
-    wallet_applied = min(delivery_fee, wallet_balance)
-    net_delivery_fee = delivery_fee - wallet_applied
-
-    return {
-        "status": "success",
-        "delivery_fee": float(delivery_fee),
-        "wallet_balance": float(wallet_balance),
-        "wallet_applied_to_delivery": float(wallet_applied),
-        "net_delivery_fee": float(net_delivery_fee)
-    }

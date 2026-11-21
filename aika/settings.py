@@ -367,6 +367,10 @@ VAPID_PUBLIC_KEY = config("VAPID_PUBLIC_KEY")
 
 GOOGLE_MAPS_API_KEY = ""
 
+OSRM_BASE_URL = config("OSRM_BASE_URL", "http://127.0.0.1:5000")
+OSRM_TIMEOUT = float(config("OSRM_TIMEOUT", "3.0"))  # seconds
+OSRM_ROAD_DETOUR_FACTOR = float(config("OSRM_ROAD_DETOUR_FACTOR", "1.35"))  # Haversine fallback multiplier
+OSRM_FALLBACK_SPEED_KMH = float(config("OSRM_FALLBACK_SPEED_KMH", "28.0"))  # Average urban speed
 
 LOGGING = {
     'version': 1,

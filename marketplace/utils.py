@@ -12,6 +12,7 @@ from accounts.models import CoverageArea
 from customers.models import CustomerWallet, CustomerWalletTransaction
 from logistics.models import LogisticsPricingConfig
 from order.models import Order
+from logistics.services.routing import Coordinate, RoutingService
 
 from .models import MarketplaceOrder
 
@@ -358,6 +359,8 @@ def _valid_coordinate(value, limit):
         number = float(value)
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(number):
+        return None
     return number if -limit <= number <= limit else None
 
 def base_delivery_fare() -> Decimal:
@@ -383,10 +386,10 @@ def sanitize_customer_coordinates(lat, lng, buyer_area):
     Returns (lat, lng); either may be None when nothing usable exists.
     """
     la, lo = _valid_coordinate(lat, 90), _valid_coordinate(lng, 180)
-    area_lat = getattr(buyer_area, 'latitude', None)
-    area_lng = getattr(buyer_area, 'longitude', None)
+    area_lat = getattr(buyer_area, "latitude", None)
+    area_lng = getattr(buyer_area, "longitude", None)
     if buyer_area is None or area_lat is None or area_lng is None:
-        return la, lo  # nothing to compare with (run geocode_coverage_areas to fill area centres)
+        return la, lo
 
     centre = (float(area_lat), float(area_lng))
     if la is None or lo is None:
@@ -395,7 +398,13 @@ def sanitize_customer_coordinates(lat, lng, buyer_area):
         return centre
     return la, lo
 
-def _calculate_distance_delivery_fee(vendor_lat, vendor_lng, customer_lat, customer_lng) -> Decimal:
+
+def _calculate_distance_delivery_fee(
+    vendor_lat,
+    vendor_lng,
+    customer_lat,
+    customer_lng,
+) -> Decimal:
     """Computes the delivery fee from live LogisticsPricingConfig records."""
     base_fare = Decimal("1000.00")
     per_km_rate = Decimal("150.00")
@@ -414,22 +423,20 @@ def _calculate_distance_delivery_fee(vendor_lat, vendor_lng, customer_lat, custo
     v_lng = _valid_coordinate(vendor_lng, 180)
     c_lat = _valid_coordinate(customer_lat, 90)
     c_lng = _valid_coordinate(customer_lng, 180)
-    if not v_lat or not v_lng or not c_lat or not c_lng:
-        return base_fare
+    if v_lat is None or v_lng is None or c_lat is None or c_lng is None:
+        return base_fare.quantize(Decimal("0.01"))
 
     try:
-        lat1, lon1 = math.radians(v_lat), math.radians(v_lng)
-        lat2, lon2 = math.radians(c_lat), math.radians(c_lng)
-        dlon, dlat = lon2 - lon1, lat2 - lat1
-        a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        origin = Coordinate(lat=float(v_lat), lng=float(v_lng))
+        destination = Coordinate(lat=float(c_lat), lng=float(c_lng))
+        route = RoutingService.get_route(origin, destination, include_geometry=False)
 
-        distance_km = Decimal(str(6371 * c))
+        distance_km = Decimal(str(route.distance_meters)) / Decimal("1000.0")
         billable_distance = max(Decimal("0.0"), distance_km - included_base_km)
         total_fee = base_fare + (billable_distance * per_km_rate)
         return total_fee.quantize(Decimal("0.01"))
     except Exception:
-        return base_fare
+        return base_fare.quantize(Decimal("0.01"))
 
 
 # =========================================================================

@@ -1,63 +1,57 @@
-import math
 from decimal import Decimal
+
+from .services.routing import Coordinate, RoutingService
+
 from .models import LogisticsPricingConfig
 
 
-def calculate_order_delivery_fee(restaurant_lat, restaurant_lng, customer_lat, customer_lng) -> Decimal:
+def calculate_order_delivery_fee(
+    restaurant_lat,
+    restaurant_lng,
+    customer_lat,
+    customer_lng,
+) -> Decimal:
     """
-    Calculates the total delivery fee based on the base fare (₦1,000) 
-    plus distance (in kilometers) from the restaurant to the customer dropoff.
+    Calculates the total delivery fee based on the base fare (₦1,000)
+    plus billable road distance (in kilometers) from the restaurant to the customer dropoff.
     """
-    # 1. Fetch pricing configuration (or fallback to model defaults)
+    # 1. Fetch pricing configuration (or fallback to defaults)
     try:
         config = LogisticsPricingConfig.objects.first()
-        base_fare = config.base_fare if config else Decimal('1000.00')
-        per_km_rate = config.per_kilometer_rate if config else Decimal('150.00')
+        base_fare = Decimal(str(config.base_fare)) if config else Decimal("1000.00")
+        per_km_rate = (
+            Decimal(str(config.per_kilometer_rate)) if config else Decimal("150.00")
+        )
     except Exception:
-        base_fare = Decimal('1000.00')
-        per_km_rate = Decimal('150.00')
+        base_fare = Decimal("1000.00")
+        per_km_rate = Decimal("150.00")
 
     # If coordinates are missing, return default base fare safely
-    if not restaurant_lat or not restaurant_lng or not customer_lat or not customer_lng:
-        return base_fare
+    if (
+        restaurant_lat is None
+        or restaurant_lng is None
+        or customer_lat is None
+        or customer_lng is None
+    ):
+        return quantize_fee(base_fare)
 
-    # 2. Calculate distance in kilometers using the Haversine formula
-    lat1, lon1 = radians(float(restaurant_lat)), radians(float(restaurant_lng))
-    lat2, lon2 = radians(float(customer_lat)), radians(float(customer_lng))
+    # 2. Fetch road distance via RoutingService (OSRM with built-in Haversine fallback)
+    try:
+        origin = Coordinate(lat=float(restaurant_lat), lng=float(restaurant_lng))
+        destination = Coordinate(lat=float(customer_lat), lng=float(customer_lng))
+        route = RoutingService.get_route(origin, destination, include_geometry=False)
+        distance_km = Decimal(str(route.distance_meters)) / Decimal("1000.0")
+    except (TypeError, ValueError):
+        return quantize_fee(base_fare)
 
-    dlon = lon2 - lon1
-    dlat = lat2 - lat1
-    a = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
-    c = 2 * atan2(sqrt(a), sqrt(1 - a))
-    
-    # Earth radius in kilometers approx 6371
-    distance_km = Decimal(str(6371 * c))
-
-    # 3. Compute final fee: Base Fare + (Distance * Rate per KM)
-    # You can optionally subtract a base distance threshold (e.g. first 1 or 2 km covered by base fare)
-    included_base_km = Decimal('1.0') 
-    billable_distance = max(Decimal('0.0'), distance_km - included_base_km)
+    # 3. Compute final fee: Base Fare + (Billable Distance * Rate per KM)
+    included_base_km = Decimal("1.0")
+    billable_distance = max(Decimal("0.0"), distance_km - included_base_km)
 
     total_fee = base_fare + (billable_distance * per_km_rate)
-
-    # Round up to the nearest 50 or 100 Naira if preferred
     return quantize_fee(total_fee)
 
-def radians(deg):
-    return deg * (math.pi / 180)
-
-def sin(x):
-    return math.sin(x)
-
-def cos(x):
-    return math.cos(x)
-
-def atan2(y, x):
-    return math.atan2(y, x)
-
-def sqrt(x):
-    return math.sqrt(x)
 
 def quantize_fee(amount: Decimal) -> Decimal:
-    # Rounds to 2 decimal places
-    return amount.quantize(Decimal('0.01'))
+    """Rounds to 2 decimal places."""
+    return amount.quantize(Decimal("0.01"))
