@@ -305,13 +305,19 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
             })
 
         categories_sidebar = []
-        sidebar_query = vendor.products.filter(is_available=True)\
-                                       .values('sub_category__id', 'sub_category__name')\
-                                       .distinct()
+        seen_subcat_ids = set()
+        
+        sidebar_query = (
+            vendor.products.filter(is_available=True, sub_category__isnull=False)
+            .order_by('sub_category__name')
+            .values('sub_category__id', 'sub_category__name')
+        )
         for cat in sidebar_query:
-            if cat['sub_category__id']:
+            sub_id = cat['sub_category__id']
+            if sub_id and sub_id not in seen_subcat_ids:
+                seen_subcat_ids.add(sub_id)
                 categories_sidebar.append({
-                    "id": cat['sub_category__id'],
+                    "id": sub_id,
                     "name": cat['sub_category__name']
                 })
 
@@ -327,7 +333,7 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
 
         available_options_prefetch = Prefetch(
             'menu_options',
-            queryset=MenuItemOption.objects.filter(is_available=True),
+            queryset=MenuItemOption.objects.filter(is_available=True).order_by('price', 'name'),
             to_attr='filtered_menu_options'
         )
         product_query = product_query.prefetch_related(available_options_prefetch)
