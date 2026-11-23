@@ -10,7 +10,7 @@ from django.db.models import F, Prefetch, Q, Exists, OuterRef
 from django.http import Http404, HttpResponse
 from django.template.loader import render_to_string
 from django.utils import timezone
-from ninja import Query, Router
+from ninja import Query, Router, Header
 from ninja.errors import HttpError
 from weasyprint import HTML
 
@@ -32,8 +32,8 @@ from .schemas import (
     StorefrontFilters, SubCategoryFilterSchema,
 )
 from .utils import (
-    AreaRequiredError, _calculate_distance_delivery_fee, apply_wallet_to_order, decide_fulfillment, ensure_payment_link,
-    parse_clean_id, release_unpaid_order, sanitize_customer_coordinates, _resolve_buyer_area
+    AreaRequiredError, KeyConflictError, _calculate_distance_delivery_fee, apply_wallet_to_order, decide_fulfillment, ensure_payment_link,
+    parse_clean_id, release_unpaid_order, sanitize_customer_coordinates, _resolve_buyer_area, _parse_idempotency_key
 )
 
 router = Router(tags=["Marketplace Storefront"])
@@ -863,7 +863,7 @@ def _cart_matches_order(order, clean_quantity_map) -> bool:
     return not remaining
 
 
-def _sync_atomic_order_writer(customer_profile, vendor, input_data):
+def _sync_atomic_order_writer(customer_profile, vendor, input_data, idempotency_key=None):
     """
     Creates the order atomically: validates the cart, locks and decrements stock
     with conditional F() updates (no oversell under concurrency), prices every
@@ -903,9 +903,27 @@ def _sync_atomic_order_writer(customer_profile, vendor, input_data):
         order_fulfillment_mode == MarketplaceOrder.FulfillmentMode.VENDOR_SELF_DELIVERY
     )
 
+
     with transaction.atomic():
         # Serialise concurrent checkouts of the same customer (double-click, retries).
         IndividualProfile.objects.select_for_update().get(pk=customer_profile.pk)
+
+        if idempotency_key:
+            existing = (
+                MarketplaceOrder.objects.filter(idempotency_key=idempotency_key)
+                .prefetch_related('items').first()
+            )
+            if existing:
+                if existing.customer_id != customer_profile.pk or not _cart_matches_order(existing, clean_quantity_map):
+                    raise KeyConflictError("This checkout attempt is no longer valid. Please try again.")
+                # Same cart but different destination or delivery option: it is a different order.
+                if (
+                    existing.delivery_address != clean_delivery_addr
+                    or (existing.base_location or "") != clean_base_loc
+                    or existing.fulfillment_mode != order_fulfillment_mode
+                ):
+                    raise KeyConflictError("Your delivery details changed. Please place the order again.")
+                return existing
 
         # --- IDEMPOTENCY / DOUBLE-CLICK GUARD: reuse only an IDENTICAL cart ---
         recent = (
@@ -929,6 +947,7 @@ def _sync_atomic_order_writer(customer_profile, vendor, input_data):
             base_location=clean_base_loc,
             status=MarketplaceOrder.OrderStatus.PENDING,
             fulfillment_mode=order_fulfillment_mode,
+            idempotency_key=idempotency_key,
         )
 
         order_items_to_create = []
@@ -1059,11 +1078,20 @@ def _sync_atomic_order_writer(customer_profile, vendor, input_data):
 
 
 @router.post("/checkout/{vendor_id}", auth=JWTAuth())
-async def checkout_order_api(request, vendor_id: str, data: CheckoutRequestInput):
+async def checkout_order_api(
+    request, 
+    vendor_id: str, 
+    data: CheckoutRequestInput,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")
+    ):
     user = request.user
 
     if user.role != CustomUser.Role.INDIVIDUAL:
         raise HttpError(403, "Only customer accounts can place orders.")
+
+    parsed_key = _parse_idempotency_key(
+        idempotency_key or getattr(data, "idempotency_key", None)
+    )
 
     try:
         customer_profile = await IndividualProfile.objects.aget(user=user)
@@ -1083,7 +1111,7 @@ async def checkout_order_api(request, vendor_id: str, data: CheckoutRequestInput
 
     # 1. Create the order (stock reserved, wallet applied)
     try:
-        order = await sync_to_async(_sync_atomic_order_writer)(customer_profile, vendor, data)
+        order = await sync_to_async(_sync_atomic_order_writer)(customer_profile, vendor, data, idempotency_key=parsed_key,)
     except ValueError as e:  # business-rule failures: stock, closed, empty cart
         raise HttpError(400, str(e))
     except Exception:

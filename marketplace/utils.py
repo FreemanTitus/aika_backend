@@ -2,7 +2,7 @@ import logging
 import math
 import uuid
 from decimal import Decimal, ROUND_HALF_UP
-
+from ninja.errors import HttpError
 import httpx
 from django.conf import settings
 from django.db import transaction
@@ -44,95 +44,121 @@ def _broadcast_new_order(vendor_id: str, payload: dict):
     except Exception:
         logger.exception("Vendor WebSocket broadcast failed for payload %s", payload.get("order_id"))
 
-
 def create_logistics_waybill(marketplace_order):
     """
-    Turns a paid MarketplaceOrder into a logistics waybill.
+    Turns a PAID, rider-delivered MarketplaceOrder into a logistics waybill.
 
-    * Idempotent: if the order already has a waybill it is returned untouched, so
-      webhook/redirect/reconcile races can never create duplicates.
-    * Must run inside the caller's transaction (or opens its own). Wrap the call in
-      a savepoint (`with transaction.atomic():`) when a failure must not abort the
+    * Idempotent and race-safe: the order row is locked and re-read, so the webhook, the redirect
+      verification, the merchant acknowledgement and the reconcile job can call it at the same
+      time and exactly one waybill is created.
+    * Refuses orders that must not get a rider job: unpaid, cancelled, already out for delivery
+      or finished, and vendor-delivered orders (those have no waybill by design).
+    * Updates the caller's `marketplace_order` instance too, so nothing downstream sees stale data.
+    * Wrap the call in a savepoint (`with transaction.atomic():`) when a failure must not abort the
       surrounding transaction.
     """
-    if marketplace_order.logistics_dispatch_id:
-        return marketplace_order.logistics_dispatch
-
-    vendor = marketplace_order.vendor
-    customer = marketplace_order.customer
-
-    # --- customer resolution (handles orders with no customer profile) ---
-    if customer and getattr(customer, "user", None):
-        customer_user = customer.user
-        resolved_customer_name = f"{customer_user.first_name} {customer_user.last_name}".strip()
-        customer_phone = getattr(customer_user, "phone_number", "") or FALLBACK_PHONE
-    else:
-        resolved_customer_name = "Marketplace Admin / Partner"
-        customer_phone = FALLBACK_PHONE
-    resolved_customer_name = resolved_customer_name or "Marketplace Client"
-
-    business_type_str = str(getattr(vendor, "business_type", "e_commerce")).lower().strip()
-    logistics_package_type = (
-        Order.PackageType.FOOD if "restaurant" in business_type_str else Order.PackageType.OTHER
-    )
-
-    # --- pickup address: base_location is a CoverageArea object, use its name ---
-    vendor_user = getattr(vendor, "user", None)
-    sender_street = (getattr(vendor_user, "street_address", "") or "") if vendor_user else ""
-    base_area = getattr(vendor_user, "base_location", None) if vendor_user else None
-    sender_base = getattr(base_area, "name", "") if base_area else ""
-    full_pickup_address = (
-        ", ".join(part for part in (sender_street, sender_base) if part)
-        or marketplace_order.base_location
-        or "Vendor Location"
-    )
-    sender_phone_num = (getattr(vendor_user, "phone_number", None) if vendor_user else None) or FALLBACK_PHONE
-
-    # --- item description (one query: product is the common case) ---
-    item_summaries = []
-    for item in marketplace_order.items.select_related("product", "product_item__product"):
-        product = item.product or (item.product_item.product if item.product_item else None)
-        item_summaries.append(f"{item.quantity}x {product.name if product else 'Item'}")
-    dynamic_description = (
-        ", ".join(item_summaries) or f"Marketplace Order #{marketplace_order.id} items."
-    )
-
     with transaction.atomic():
+        order = (
+            MarketplaceOrder.objects.select_for_update(of=("self",))
+            .select_related("vendor__user__base_location", "customer__user")
+            .get(pk=marketplace_order.pk)
+        )
+
+        # Already has one: return it (this is what makes retries and races harmless).
+        if order.logistics_dispatch_id:
+            marketplace_order.logistics_dispatch_id = order.logistics_dispatch_id
+            marketplace_order.status = order.status
+            return order.logistics_dispatch
+
+        if order.fulfillment_mode == MarketplaceOrder.FulfillmentMode.VENDOR_SELF_DELIVERY:
+            raise ValueError(f"Order {order.id} is delivered by the vendor: no waybill is created.")
+
+        # Only paid orders that have not been dispatched yet may get a rider job.
+        if order.status not in (
+            MarketplaceOrder.OrderStatus.PROCESSING,
+            MarketplaceOrder.OrderStatus.PAID_UNASSIGNED,
+        ):
+            raise ValueError(f"Order {order.id} is '{order.status}': a waybill cannot be created.")
+
+        vendor = order.vendor
+        customer = order.customer
+
+        # --- customer resolution (handles orders with no customer profile) ---
+        if customer and getattr(customer, "user", None):
+            customer_user = customer.user
+            resolved_customer_name = f"{customer_user.first_name} {customer_user.last_name}".strip()
+            customer_phone = getattr(customer_user, "phone_number", "") or FALLBACK_PHONE
+        else:
+            resolved_customer_name = "Marketplace Admin / Partner"
+            customer_phone = FALLBACK_PHONE
+        resolved_customer_name = resolved_customer_name or "Marketplace Client"
+
+        business_type_str = str(getattr(vendor, "business_type", "e_commerce")).lower().strip()
+        logistics_package_type = (
+            Order.PackageType.FOOD if "restaurant" in business_type_str else Order.PackageType.OTHER
+        )
+
+        # --- pickup address: base_location is a CoverageArea object, use its name ---
+        vendor_user = getattr(vendor, "user", None)
+        sender_street = (getattr(vendor_user, "street_address", "") or "") if vendor_user else ""
+        base_area = getattr(vendor_user, "base_location", None) if vendor_user else None
+        sender_base = getattr(base_area, "name", "") if base_area else ""
+        full_pickup_address = (
+            ", ".join(part for part in (sender_street, sender_base) if part)
+            or order.base_location
+            or "Vendor Location"
+        )
+        sender_phone_num = (
+            (getattr(vendor_user, "phone_number", None) if vendor_user else None) or FALLBACK_PHONE
+        )
+
+        # --- item description (one query) ---
+        item_summaries = []
+        for item in order.items.select_related("product", "product_item__product"):
+            product = item.product or (item.product_item.product if item.product_item else None)
+            item_summaries.append(f"{item.quantity}x {product.name if product else 'Item'}")
+        dynamic_description = ", ".join(item_summaries) or f"Marketplace Order #{order.id} items."
+
         logistics_waybill = Order.objects.create(
-            marketplace_order=marketplace_order,
+            marketplace_order=order,
             sender=vendor,
             receiver=customer,
-            sender_name=vendor.company_name,
+            sender_name=getattr(vendor, "company_name", "") or "Vendor",
             sender_phone=sender_phone_num,
             pickup_address=full_pickup_address,
             receiver_name=resolved_customer_name,
             receiver_phone=customer_phone,
-            delivery_address=marketplace_order.delivery_address,
+            delivery_address=order.delivery_address,
             package_type=logistics_package_type,
             package_description=dynamic_description,
-            delivery_fee=marketplace_order.delivery_fee,
+            delivery_fee=order.delivery_fee,
             is_cash_on_delivery=False,
             cod_amount_to_collect=Decimal("0.00"),
             status=Order.OrderStatus.PENDING,
         )
 
+        order.logistics_dispatch = logistics_waybill
+        order.status = MarketplaceOrder.OrderStatus.PAID_UNASSIGNED
+        order.save(update_fields=["logistics_dispatch", "status"])
+
+        # Keep the caller's instance in step with what was just written.
         marketplace_order.logistics_dispatch = logistics_waybill
-        marketplace_order.status = MarketplaceOrder.OrderStatus.PAID_UNASSIGNED
-        marketplace_order.save(update_fields=["logistics_dispatch", "status"])
+        marketplace_order.status = order.status
 
-    # --- real-time alert, only after the data is durably committed ---
-    base_loc_str = str(marketplace_order.base_location or "")
-    payload = {
-        "order_id": str(marketplace_order.id),
-        "total_price": float(marketplace_order.subtotal or 0),
-        "delivery_address": f"{marketplace_order.delivery_address} | {base_loc_str}".strip(" |"),
-        "items_summary": item_summaries,
-        "customer_name": resolved_customer_name,
-        "customer_phone": customer_phone,
-    }
-    transaction.on_commit(lambda: _broadcast_new_order(vendor.id, payload))
+        # --- real-time alert, only after the data is durably committed ---
+        vendor_id = order.vendor_id
+        payload = {
+            "order_id": str(order.id),
+            "total_price": float(order.subtotal or 0),
+            "delivery_address": f"{order.delivery_address} | {order.base_location or ''}".strip(" |"),
+            "items_summary": item_summaries,
+            "customer_name": resolved_customer_name,
+            "customer_phone": customer_phone,
+            "delivery_mode": "platform_dispatch",
+        }
+        transaction.on_commit(lambda: _broadcast_new_order(vendor_id, payload))
 
-    return logistics_waybill
+        return logistics_waybill
 
 
 # =========================================================================
@@ -141,6 +167,8 @@ def create_logistics_waybill(marketplace_order):
 class AreaRequiredError(ValueError):
     """The buyer's delivery area is needed to pick a delivery option (the quote asks for it)."""
 
+class KeyConflictError(Exception):
+    """The Idempotency-Key cannot be reused (different cart, other customer, or order closed)."""
 
 # =========================================================================
 # FULFILLMENT ROUTING (platform riders vs. vendor self-delivery)
@@ -549,7 +577,12 @@ def _cancel_locked_order(order_id, allowed_statuses):
             ).update(status=Order.OrderStatus.CANCELLED)
 
         order.status = MarketplaceOrder.OrderStatus.CANCELLED
-        order.save(update_fields=["status"])
+        update_fields = ["status"]
+        if not was_paid:
+            # Unpaid release (gateway failure / stale order): the checkout attempt can be retried.
+            order.idempotency_key = None
+            update_fields.append("idempotency_key")
+        order.save(update_fields=update_fields)
         return order, was_paid
 
 
@@ -573,3 +606,12 @@ def cancel_order_before_pickup(order_id):
         MarketplaceOrder.OrderStatus.PAID_UNASSIGNED,
         MarketplaceOrder.OrderStatus.PROCESSING,
     ))
+
+
+def _parse_idempotency_key(raw_key: str | None) -> uuid.UUID | None:
+    if not raw_key:
+        return None
+    try:
+        return uuid.UUID(str(raw_key).strip())
+    except (ValueError, AttributeError):
+        raise HttpError(400, "Invalid Idempotency-Key header.")

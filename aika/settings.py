@@ -119,6 +119,33 @@ if DEBUG:
         "http://10.136.16.114:8000",
     ]
 
+    # Allow standard headers and methods
+    CORS_ALLOW_METHODS = [
+        'DELETE',
+        'GET',
+        'OPTIONS',
+        'PATCH',
+        'POST',
+        'PUT',
+    ]
+
+    CORS_ALLOW_HEADERS = [
+        "idempotency-key",
+        'accept',
+        'accept-encoding',
+        'authorization',
+        'content-type',
+        'dnt',
+        'origin',
+        'user-agent',
+        'x-csrftoken',
+        'x-requested-with',
+        'ngrok-skip-browser-warning',
+        'x-chat-token',        # guest support-chat secret
+        'x-captcha-token',     # Turnstile token sent on registration
+        'bypass-tunnel-reminder', # Include this if using localtunnel headers
+    ]
+
 # FRONTEND_URL = "http://172.20.10.4:8000"
 FRONTEND_URL = "https://www.useaika.ng"
 
@@ -169,6 +196,7 @@ CORS_ALLOW_METHODS = [
 ]
 
 CORS_ALLOW_HEADERS = [
+    "idempotency-key",
     'accept',
     'accept-encoding',
     'authorization',
@@ -315,7 +343,7 @@ MAILERS = {
             "port": config("EMAIL_PORT", default=465, cast=int),
             "use_tls": False,
             "use_ssl": True,
-            "username": config("EMAIL_HOST_USER", default="mail.useaika.ng"),
+            "username": config("EMAIL_HOST_USER"),
             "password": config("EMAIL_HOST_PASSWORD"),   # required: never commit it
         },
     },

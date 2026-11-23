@@ -458,16 +458,17 @@ def login_user_api(request, data: UserLoginSchema):
     # Dashboard redirection assignments
     redirect_target = "/customer/dashboard"
 
-    if user.is_superuser or user.Role.ADMIN:
+    if user.is_superuser or user.role == CustomUser.Role.ADMIN:
         redirect_target = "/admin/dashboard"
     elif user.role == CustomUser.Role.STAFF:
         redirect_target = "/staff/dashboard"
     elif user.role == CustomUser.Role.AGENT:
         redirect_target = "/agent/dashboard"
-    elif user.role == CustomUser.Role.AGENT:
-        redirect_target = "/agent/dashboard"
     elif user.role == CustomUser.Role.BUSINESS:
         redirect_target = "/merchant/dashboard"
+    elif user.role == CustomUser.Role.INDIVIDUAL:
+        redirect_target = "/customer/dashboard"
+
 
     token = create_jwt_for_user(user)
 

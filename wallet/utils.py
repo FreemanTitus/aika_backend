@@ -56,7 +56,7 @@ def get_paystack_bank_list():
     return {}
 
 
-def _paystack_confirms(order, reference) -> bool:
+def _paystack_confirms(order, reference, gateway_amount_kobo=None) -> bool:
     """
     True only if Paystack itself reports a successful charge for THIS order:
     the reference must be the one stored on the order, the currency NGN and the
@@ -69,6 +69,9 @@ def _paystack_confirms(order, reference) -> bool:
     """
     if not reference or reference != order.payment_reference:
         return False
+
+    expected = Decimal(str(order.total_price))
+
     try:
         res = httpx.get(
             f"https://api.paystack.co/transaction/verify/{quote(reference, safe='')}",
@@ -82,7 +85,16 @@ def _paystack_confirms(order, reference) -> bool:
 
     data = body.get("data") or {}
     paid_naira = Decimal(str(data.get("amount", 0))) / Decimal("100")
-    expected = Decimal(str(order.total_price))
+    
+
+    if gateway_amount_kobo is not None:
+        webhook_naira = Decimal(str(gateway_amount_kobo)) / Decimal("100")
+        if webhook_naira < expected:
+            logger.warning(
+                "Webhook amount below expected for order %s: webhook=%s vs expected=%s",
+                order.id, webhook_naira, expected,
+            )
+            return False
 
     if (
         body.get("status") is True
@@ -146,7 +158,8 @@ def _queue_late_payment_refund(order, reference):
     except Exception:
         logger.exception("Could not queue the late-payment refund for order %s", order.id)
         
-def verify_order_payment(order_id, transaction_id=None):
+
+def verify_order_payment(order_id, transaction_id=None, gateway_amount_kobo=None):
     """
     Idempotent, race-safe payment confirmation. Returns True if the order is (now)
     paid. Called by the webhook, the redirect callback and the verify endpoint;
@@ -159,34 +172,40 @@ def verify_order_payment(order_id, transaction_id=None):
         return True
 
     reference = transaction_id or order.payment_reference
+    if not reference:
+        order.refresh_from_db(fields=["status"])
+        return order.status in PAID_ORDER_STATES
 
     if order.status == MarketplaceOrder.OrderStatus.CANCELLED:
-        # The customer paid after we released the order: money was taken for an
-        # order we will not fulfil. Do not revive it silently; alert for a refund.
-        if _paystack_confirms(order, reference):
+        if _paystack_confirms(order, reference, gateway_amount_kobo=gateway_amount_kobo):
             logger.critical(
-                "PAID CANCELLED ORDER: order %s, reference %s. Refund required.",
+                "PAID CANCELLED ORDER: order %s, reference %s. Refund request queued.",
                 order.id, reference,
             )
+            _queue_late_payment_refund(order, reference)
         return False
 
     # Network call happens outside any DB transaction / lock.
-    if not _paystack_confirms(order, reference):
+    if not _paystack_confirms(order, reference, gateway_amount_kobo=gateway_amount_kobo):
         # The webhook may have settled it while we were waiting on the HTTP call.
-        order.refresh_from_db(fields=['status'])
+        order.refresh_from_db(fields=["status"])
         return order.status in PAID_ORDER_STATES
 
     with transaction.atomic():
         order = (
-            MarketplaceOrder.objects.select_for_update(of=('self',))
-            .select_related('vendor', 'vendor__user', 'customer', 'customer__user')
+            MarketplaceOrder.objects.select_for_update(of=("self",))
+            .select_related("vendor", "vendor__user", "customer", "customer__user")
             .get(id=order_id)
         )
         if order.status != MarketplaceOrder.OrderStatus.PENDING:
             return order.status in PAID_ORDER_STATES
 
         order.status = MarketplaceOrder.OrderStatus.PROCESSING
-        order.save(update_fields=['status'])
+        update_fields = ["status"]
+        if not order.paid_at:
+            order.paid_at = timezone.now()
+            update_fields.append("paid_at")
+        order.save(update_fields=update_fields)
 
         try:
             with transaction.atomic():  # savepoint: a failure must not poison this transaction
@@ -200,6 +219,8 @@ def verify_order_payment(order_id, transaction_id=None):
             # command (or the merchant's acknowledgement) creates the missing waybill; vendor-
             # delivered orders can be acknowledged straight from PROCESSING.
             logger.exception("Post-payment dispatch step failed for paid order %s; needs retry", order.id)
+
+        order.refresh_from_db()
 
     return True
 

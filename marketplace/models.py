@@ -328,9 +328,12 @@ class MarketplaceOrder(models.Model):
     delivery_address = models.TextField()
     status = models.CharField(max_length=20, choices=OrderStatus.choices, default=OrderStatus.PENDING)
 
+    # Prevents duplicate order creation & duplicate wallet deduction when network drops on checkout
+    idempotency_key = models.UUIDField(unique=True, null=True, blank=True, db_index=True)
     payment_reference = models.CharField(max_length=100, unique=True, null=True, blank=True)
     wallet_applied = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
     payment_checkout_url = models.URLField(max_length=500, null=True, blank=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
 
     class FulfillmentMode(models.TextChoices):
         PLATFORM_DISPATCH = 'platform_dispatch', 'Platform Rider Dispatch'
