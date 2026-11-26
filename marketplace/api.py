@@ -283,7 +283,7 @@ def get_marketplace_products_api(
         )
         .annotate(
             effective_plan_price=Coalesce(
-                'vendorsubscription__plan__price',
+                'vendor__vendorsubscription__plan__price',
                 Value(Decimal("0.00")),
                 output_field=DecimalField(max_digits=12, decimal_places=2),
             )
