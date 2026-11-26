@@ -43,12 +43,17 @@ from marketplace.models import (
 )
 from payment.models import VendorSubscription
 from marketing.models import SystemBroadcast
+from .utils import active_merchant_access_q, evaluate_merchant_subscription_or_trial
+
+
+
 
 router = Router(tags=["Merchant Dashboard & Inventory Management"], auth=JWTAuth())
 
 # Initialize a standard production logger
-logger = logging.getLogger("wegofera.marchant")
+logger = logging.getLogger("aika.merchant")
 
+TRIAL_MAX_PRODUCTS = 15
 
 def parse_json_field(value, field_name):
     if not isinstance(value, str) or not value.strip():
@@ -62,39 +67,52 @@ def parse_json_field(value, field_name):
 # =========================================================================
 # 1. MERCHANT ANALYTICS DASHBOARD SUMMARY
 # =========================================================================
-@router.get("/dashboard/summary", auth=JWTAuth())
+@router.get("/dashboard/summary")
 def get_merchant_dashboard_summary_api(request):
     """
-    Synchronously aggregates marketplace order metrics, history logs, 
+    Synchronously aggregates marketplace order metrics, history logs,
     and dynamic chart trends for the active merchant profile.
     """
     try:
-        profile = MerchantProfile.objects.get(user=request.user)
+        profile = MerchantProfile.objects.select_related("user").get(user=request.user)
     except MerchantProfile.DoesNotExist:
         return JsonResponse({"detail": "Merchant identity profile not found."}, status=403)
-    
-    # --- Fetch Subscription Status ---
+
+    # --- Fetch Subscription & 7-Day Trial Status ---
+    access_status = evaluate_merchant_subscription_or_trial(profile)
+
     try:
-        subscription = VendorSubscription.objects.select_related('plan').get(vendor_profile=profile)
-        has_valid_access = subscription.has_valid_access
-        plan_name = subscription.plan.name if subscription.plan else "No Active Plan"
+        subscription = VendorSubscription.objects.select_related("plan").get(vendor_profile=profile)
+        sub_has_access = bool(subscription.has_valid_access)
+        sub_plan_name = subscription.plan.name if subscription.plan else None
         remaining_orders = subscription.remaining_orders
     except VendorSubscription.DoesNotExist:
-        has_valid_access = False
-        plan_name = "No Active Plan"
-        remaining_orders = 0
+        sub_has_access = False
+        sub_plan_name = None
+        remaining_orders = None
+
+    has_valid_access = bool(sub_has_access or access_status.has_access)
+
+    if sub_has_access and sub_plan_name:
+        plan_name = sub_plan_name
+    elif access_status.is_on_trial:
+        plan_name = f"7-Day Free Trial ({access_status.trial_days_remaining}d left)"
+    elif access_status.reason == "trial_expired":
+        plan_name = "Free Trial Expired"
+    else:
+        plan_name = sub_plan_name or "No Active Plan"
 
     metrics_query = MarketplaceOrder.objects.filter(vendor=profile).aggregate(
-        total_rev=Sum('subtotal', filter=Q(status='completed')),
-        total_count=Count('id'),
-        completed_count=Count('id', filter=Q(status='completed')),
-        active_count=Count('id', filter=Q(status='processing'))
+        total_rev=Sum("subtotal", filter=Q(status="completed")),
+        total_count=Count("id"),
+        completed_count=Count("id", filter=Q(status="completed")),
+        active_count=Count("id", filter=Q(status="processing")),
     )
 
-    total_revenue = float(metrics_query['total_rev'] or 0.0)
-    orders_count = metrics_query['total_count'] or 0
-    completed_count = metrics_query['completed_count'] or 0
-    active_deliveries = metrics_query['active_count'] or 0
+    total_revenue = float(metrics_query["total_rev"] or 0.0)
+    orders_count = metrics_query["total_count"] or 0
+    completed_count = metrics_query["completed_count"] or 0
+    active_deliveries = metrics_query["active_count"] or 0
 
     success_rate = round((completed_count / orders_count) * 100, 1) if orders_count > 0 else 0.0
 
@@ -103,23 +121,27 @@ def get_merchant_dashboard_summary_api(request):
     # =========================================================================
     today = timezone.now().date()
     start_date = today - timedelta(days=6)
-    
-    recent_trend_qs = MarketplaceOrder.objects.filter(
-        vendor=profile,
-        created_at__date__gte=start_date
-    ).annotate(
-        order_date=TruncDate('created_at')
-    ).values('order_date').annotate(
-        daily_revenue=Sum('subtotal'),
-        daily_count=Count('id')
-    ).order_by('order_date')
+
+    recent_trend_qs = (
+        MarketplaceOrder.objects.filter(
+            vendor=profile,
+            created_at__date__gte=start_date,
+        )
+        .annotate(order_date=TruncDate("created_at"))
+        .values("order_date")
+        .annotate(
+            daily_revenue=Sum("subtotal"),
+            daily_count=Count("id"),
+        )
+        .order_by("order_date")
+    )
 
     trend_map = {}
     for entry in recent_trend_qs:
-        d_str = str(entry['order_date'])
+        d_str = str(entry["order_date"])
         trend_map[d_str] = {
-            "revenue": float(entry['daily_revenue'] or 0.0),
-            "count": int(entry['daily_count'] or 0)
+            "revenue": float(entry["daily_revenue"] or 0.0),
+            "count": int(entry["daily_count"] or 0),
         }
 
     days_labels = []
@@ -129,8 +151,8 @@ def get_merchant_dashboard_summary_api(request):
     for i in range(7):
         current_d = start_date + timedelta(days=i)
         d_str = str(current_d)
-        days_labels.append(current_d.strftime('%a'))
-        
+        days_labels.append(current_d.strftime("%a"))
+
         data_point = trend_map.get(d_str, {"revenue": 0.0, "count": 0})
         days_revenue.append(data_point["revenue"])
         days_volumes.append(data_point["count"])
@@ -139,15 +161,17 @@ def get_merchant_dashboard_summary_api(request):
     # RECENT ORDERS LIST
     # =========================================================================
     recent_orders = []
-    orders_queryset = MarketplaceOrder.objects.filter(vendor=profile)\
-        .select_related('customer', 'customer__user', 'logistics_dispatch')\
-        .order_by('-created_at')[:10]
-    
+    orders_queryset = (
+        MarketplaceOrder.objects.filter(vendor=profile)
+        .select_related("customer", "customer__user", "logistics_dispatch")
+        .order_by("-created_at")[:10]
+    )
+
     for order in orders_queryset:
         c_name = order.customer.first_name if order.customer else "Walk-in Customer"
-        c_phone = order.customer.user.phone_number if order.customer else ""
+        c_phone = order.customer.user.phone_number if (order.customer and order.customer.user) else ""
 
-        ref = getattr(order.logistics_dispatch, 'order_reference', order.id) or order.id
+        ref = getattr(order.logistics_dispatch, "order_reference", order.id) or order.id
 
         recent_orders.append({
             "id": order.id,
@@ -165,27 +189,30 @@ def get_merchant_dashboard_summary_api(request):
             "subscription": {
                 "has_valid_access": has_valid_access,
                 "plan_name": plan_name,
-                "remaining_orders": remaining_orders
+                "remaining_orders": remaining_orders,
+                "is_on_trial": access_status.is_on_trial,
+                "trial_days_remaining": access_status.trial_days_remaining,
+                "trial_ends_at": profile.trial_ends_at.isoformat() if profile.trial_ends_at else None,
+                "access_reason": access_status.reason,
             },
             "metrics": {
                 "total_revenue": total_revenue,
                 "orders_count": orders_count,
                 "success_rate": success_rate,
-                "active_deliveries": active_deliveries
+                "active_deliveries": active_deliveries,
             },
             "recent_orders": recent_orders,
             "chart_trends": {
                 "days_labels": days_labels,
                 "days_revenue": days_revenue,
-                "days_volumes": days_volumes
-            }
-        }
+                "days_volumes": days_volumes,
+            },
+        },
     }
-
 # =========================================================================
 # 2. INVENTORY LIST VIEW
 # =========================================================================
-@router.get("/inventory", auth=JWTAuth())
+@router.get("/inventory")
 def list_merchant_inventory_api(request):
     """
     Asynchronously queries all catalog profiles owned by the logged-in merchant,
@@ -452,23 +479,42 @@ def get_inventory_metadata(request, sub_category_id: int = None):
 def add_product_api(request, data: Form[ProductSavePayloadSchema]):
     if request.user.role != 'business':
         raise HttpError(403, "Unauthorized access channel.")
-        
+
     try:
         profile = MerchantProfile.objects.get(user=request.user)
     except MerchantProfile.DoesNotExist:
         raise HttpError(404, "Merchant profile workspace not found.")
-    
-    # --- Vendor Subscription & Product Limit Validation ---
+
+    # --- Vendor Subscription & 7-Day Free Trial Validation ---
+    access_status = evaluate_merchant_subscription_or_trial(profile)
+
     try:
         subscription = VendorSubscription.objects.select_related('plan').get(vendor_profile=profile)
     except VendorSubscription.DoesNotExist:
-        raise HttpError(403, "No active subscription plan found. Please subscribe to add products.")
+        subscription = None
 
-    if not subscription.can_add_product:
-        if not subscription.has_valid_access:
-            raise HttpError(403, "Your subscription has expired or is inactive.")
-        else:
-            raise HttpError(403, f"Product limit reached for your '{subscription.plan.name}' tier.")
+    if subscription is not None:
+        if not subscription.can_add_product:
+            if not subscription.has_valid_access and not access_status.has_access:
+                raise HttpError(403, "Your subscription or 7-day free trial has expired. Please subscribe to add products.")
+            if access_status.is_on_trial:
+                current_count = Product.objects.filter(vendor=profile).count()
+                if current_count >= TRIAL_MAX_PRODUCTS:
+                    raise HttpError(403, f"Free trial limit of {TRIAL_MAX_PRODUCTS} products reached. Upgrade your plan to add more.")
+            else:
+                plan_label = subscription.plan.name if subscription.plan else "current"
+                raise HttpError(403, f"Product limit reached for your '{plan_label}' tier.")
+    else:
+        # No VendorSubscription row: allow if on an active 7-day free trial
+        if not access_status.has_access:
+            if access_status.reason == "trial_expired":
+                raise HttpError(403, "Your 7-day free trial has expired. Please subscribe to add products.")
+            raise HttpError(403, "No active subscription or free trial found. Please subscribe to add products.")
+
+        if access_status.is_on_trial:
+            current_count = Product.objects.filter(vendor=profile).count()
+            if current_count >= TRIAL_MAX_PRODUCTS:
+                raise HttpError(403, f"Free trial limit of {TRIAL_MAX_PRODUCTS} products reached. Upgrade your plan to add more.")
 
     is_restaurant = profile.business_type == 'restaurant'
     store_type = 'restaurant' if is_restaurant else 'ecommerce'
@@ -500,15 +546,15 @@ def add_product_api(request, data: Form[ProductSavePayloadSchema]):
 
     try:
         product_id = _sync_add_product_worker(
-            user=request.user, 
-            profile=profile, 
-            store_type=store_type, 
-            data=data, 
+            user=request.user,
+            profile=profile,
+            store_type=store_type,
+            data=data,
             key_features=parsed_key_features if not is_restaurant else [],
-            variant_options=parsed_variant_options if not is_restaurant else [], 
-            sku_items=parsed_sku_items if not is_restaurant else [], 
-            gallery_images=parsed_gallery_images if not is_restaurant else [], 
-            request_files=request.FILES, 
+            variant_options=parsed_variant_options if not is_restaurant else [],
+            sku_items=parsed_sku_items if not is_restaurant else [],
+            gallery_images=parsed_gallery_images if not is_restaurant else [],
+            request_files=request.FILES,
             menu_options=parsed_menu_options if is_restaurant else []
         )
 
@@ -517,13 +563,13 @@ def add_product_api(request, data: Form[ProductSavePayloadSchema]):
         absolute_image_url = f"{base_host}{product_obj.image.url}" if product_obj.image else None
 
         return 200, {
-            "status": "success", 
-            "message": f"Successfully published {data.name}.", 
+            "status": "success",
+            "message": f"Successfully published {data.name}.",
             "product_id": product_id,
             "image_url": absolute_image_url
         }
-        
-    except Exception as e:
+
+    except Exception:
         logger.exception("Complex catalog submission failed.")
         raise HttpError(500, "Unable to construct product lifecycle rows.")
 

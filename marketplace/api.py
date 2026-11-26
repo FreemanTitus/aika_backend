@@ -3,7 +3,8 @@ import logging
 from datetime import timedelta
 from decimal import Decimal
 from typing import Optional
-
+from django.db.models import Value
+from django.db.models.functions import Coalesce
 from asgiref.sync import sync_to_async
 from django.db import transaction
 from django.db.models import F, Prefetch, Q, Exists, OuterRef
@@ -35,6 +36,9 @@ from .utils import (
     AreaRequiredError, KeyConflictError, _calculate_distance_delivery_fee, apply_wallet_to_order, decide_fulfillment, ensure_payment_link,
     parse_clean_id, release_unpaid_order, sanitize_customer_coordinates, _resolve_buyer_area, _parse_idempotency_key
 )
+from merchant.utils import active_merchant_access_q
+
+
 
 router = Router(tags=["Marketplace Storefront"])
 
@@ -51,6 +55,19 @@ def _optional_user(request):
     if header.startswith("Bearer "):
         return verify_jwt_token(header[7:].strip())
     return None
+
+def _prefixed_q(q_obj: Q, prefix: str) -> Q:
+    """Prefixes every lookup path inside a Q object, e.g. 'trial_ends_at__gt' -> 'vendor__trial_ends_at__gt'."""
+    cloned = Q()
+    cloned.connector = q_obj.connector
+    cloned.negated = q_obj.negated
+    for child in q_obj.children:
+        if isinstance(child, Q):
+            cloned.children.append(_prefixed_q(child, prefix))
+        else:
+            field_path, val = child
+            cloned.children.append((f"{prefix}{field_path}", val))
+    return cloned
 
 
 def _clear_user_cart_for_order(order):
@@ -110,7 +127,7 @@ def get_marketplace_vendors_api(
     category: Optional[str] = None,
 ):
     """
-    Retrieves marketplace vendors.
+    Retrieves marketplace vendors (active paid subscribers AND active 7-day trial vendors).
     Restaurants are restricted strictly to the customer's selected base location hub.
     E-commerce and other businesses remain globally visible.
     """
@@ -120,21 +137,27 @@ def get_marketplace_vendors_api(
         if hasattr(request.user, 'base_location_id'):
             customer_location_id = request.user.base_location_id
 
-    query_set = MerchantProfile.objects.filter(
-        is_approved=True,
-        is_active_store=True,
-        vendorsubscription__is_active=True,
-        vendorsubscription__subscription_expires_at__gt=now
-    ).select_related(
-        'user',
-        'user__base_location',
-        'vendorsubscription',
-        'vendorsubscription__plan',
-        'storefront_config'
-    ).order_by(
-        '-vendorsubscription__plan__price',
-        '-rating',
-        '-review_count'
+    query_set = (
+        MerchantProfile.objects.filter(
+            is_approved=True,
+            is_active_store=True,
+        )
+        .filter(active_merchant_access_q(now))
+        .select_related(
+            'user',
+            'user__base_location',
+            'vendorsubscription',
+            'vendorsubscription__plan',
+            'storefront_config',
+        )
+        .annotate(
+            effective_plan_price=Coalesce('vendorsubscription__plan__price', Value(0))
+        )
+        .order_by(
+            '-effective_plan_price',
+            '-rating',
+            '-review_count',
+        )
     )
 
     resolved_cat = _resolve_product_category(category)
@@ -148,8 +171,22 @@ def get_marketplace_vendors_api(
         base_loc = str(vendor.user.base_location.name) if (vendor.user and vendor.user.base_location) else ''
 
         active_sub = getattr(vendor, 'vendorsubscription', None)
-        plan_name = active_sub.plan.name if active_sub and active_sub.plan else 'Standard'
-        plan_price = float(active_sub.plan.price) if active_sub and active_sub.plan else 0.0
+        has_valid_sub = bool(
+            active_sub
+            and active_sub.is_active
+            and (active_sub.subscription_expires_at is None or active_sub.subscription_expires_at > now)
+        )
+
+        if has_valid_sub and active_sub.plan:
+            plan_name = active_sub.plan.name
+            plan_price = float(active_sub.plan.price)
+        elif vendor.trial_ends_at and vendor.trial_ends_at > now:
+            plan_name = 'Free Trial'
+            plan_price = 0.0
+        else:
+            plan_name = 'Standard'
+            plan_price = 0.0
+
         is_premium = plan_price >= 15000
 
         storefront = getattr(vendor, 'storefront_config', None)
@@ -172,6 +209,7 @@ def get_marketplace_vendors_api(
             "closing_time": vendor.closing_time.strftime("%H:%M") if vendor.closing_time else "22:00",
             "subscription_tier": plan_name,
             "subscription_price": plan_price,
+            "is_on_trial": not has_valid_sub and bool(vendor.trial_ends_at and vendor.trial_ends_at > now),
             "is_featured_recommendation": is_premium,
             "hero_image": hero_image_url,
             "store_slug": store_slug,
@@ -215,7 +253,7 @@ def get_marketplace_products_api(
     limit: int = 36,
 ):
     """
-    Retrieves available products/dishes across active, subscribed merchants.
+    Retrieves available products/dishes across active merchants (paid subscription or active trial).
     Applies restaurant location geofencing and optional category/search filters.
     """
     now = timezone.now()
@@ -229,9 +267,8 @@ def get_marketplace_products_api(
             is_available=True,
             vendor__is_approved=True,
             vendor__is_active_store=True,
-            vendor__vendorsubscription__is_active=True,
-            vendor__vendorsubscription__subscription_expires_at__gt=now,
         )
+        .filter(_prefixed_q(active_merchant_access_q(now), "vendor__"))
         .select_related(
             "vendor",
             "vendor__user",
@@ -240,7 +277,11 @@ def get_marketplace_products_api(
             "sub_category",
             "brand",
         )
-        .order_by("-vendor__vendorsubscription__plan__price", "-vendor__rating", "name")
+        .annotate(
+            effective_plan_price=Coalesce("vendor__vendorsubscription__plan__price", Value(0))
+        )
+        .order_by("-effective_plan_price", "-vendor__rating", "name")
+        .distinct()
     )
 
     # Filter by marketplace tab / business type if specified
@@ -329,11 +370,11 @@ def get_marketplace_products_api(
             "count": len(items),
         },
     }
+
+
 # =========================================================================
 # 2. GET VENDOR STOREFRONT DETAILS
 # =========================================================================
-
-
 def _resolve_product_category(category_param: str | None) -> str | None:
     """Normalizes a category slug or display label into Product.CategoryChoices value."""
     if not category_param:

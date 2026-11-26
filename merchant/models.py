@@ -3,7 +3,24 @@ from django.db import models
 from django.core.validators import MinValueValidator, MaxValueValidator
 from django.conf import settings
 from django.utils.text import slugify
+from datetime import timedelta
 from django.utils import timezone
+from .utils import (
+    ensure_merchant_trial_on_approval,
+    evaluate_merchant_subscription_or_trial,
+)
+
+
+from datetime import timedelta
+from django.conf import settings
+from django.core.validators import MaxValueValidator, MinValueValidator
+from django.db import models
+from django.utils import timezone
+
+from .utils import (
+    ensure_merchant_trial_on_approval,
+    evaluate_merchant_subscription_or_trial,
+)
 
 
 class MerchantProfile(models.Model):
@@ -24,16 +41,16 @@ class MerchantProfile(models.Model):
 
     id = models.CharField(primary_key=True, max_length=20, editable=False)
     user = models.OneToOneField(
-        settings.AUTH_USER_MODEL,  
-        on_delete=models.CASCADE, 
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
         related_name='merchant_profile'
     )
     company_name = models.CharField(max_length=255, help_text="Business name or Individual full name")
     business_type = models.CharField(
-        max_length=30, 
-        choices=BusinessType.choices, 
-        blank=True, 
-        null=True, 
+        max_length=30,
+        choices=BusinessType.choices,
+        blank=True,
+        null=True,
         help_text="Leave blank if user is just a regular individual account"
     )
     ecommerce_sub_category = models.CharField(
@@ -45,9 +62,9 @@ class MerchantProfile(models.Model):
     )
     # PAYSTACK SPLIT PAYMENTS
     paystack_subaccount_code = models.CharField(
-        max_length=50, 
-        blank=True, 
-        null=True, 
+        max_length=50,
+        blank=True,
+        null=True,
         help_text="Paystack subaccount code (e.g., SUB_xxxxxxxx) for automated checkout splits."
     )
     assigned_agent = models.ForeignKey(
@@ -56,11 +73,11 @@ class MerchantProfile(models.Model):
         null=True,
         blank=True,
         related_name='managed_vendors',
-        limit_choices_to={'role': 'staff'}, 
+        limit_choices_to={'role': 'staff'},
         help_text="The internal operations agent responsible for overseeing notifications and bike dispatches for this vendor."
     )
     rating = models.DecimalField(
-        max_digits=3, 
+        max_digits=3,
         decimal_places=2,
         default=0.00,
         validators=[MinValueValidator(0.00), MaxValueValidator(5.00)],
@@ -72,10 +89,19 @@ class MerchantProfile(models.Model):
     count_3_stars = models.PositiveIntegerField(default=0)
     count_2_stars = models.PositiveIntegerField(default=0)
     count_1_stars = models.PositiveIntegerField(default=0)
+
     is_approved = models.BooleanField(default=False, help_text="Admin approval for corporate/business accounts")
     is_active_store = models.BooleanField(default=True, help_text="If false, the store will not be visible in the marketplace or accept orders.")
     opening_time = models.TimeField(help_text="When the restaurant opens (e.g., 08:00:00)", default="00:00")
     closing_time = models.TimeField(help_text="When the restaurant closes (e.g., 22:00:00)", default="00:00")
+
+    is_subscribed = models.BooleanField(default=False)
+    subscription_expires_at = models.DateTimeField(null=True, blank=True)
+
+    # 7-Day Free Trial fields
+    trial_started_at = models.DateTimeField(null=True, blank=True)
+    trial_ends_at = models.DateTimeField(null=True, blank=True)
+    has_used_free_trial = models.BooleanField(default=False)
 
     @property
     def is_currently_open(self):
@@ -84,7 +110,7 @@ class MerchantProfile(models.Model):
         Handles standard days as well as overnight shifts.
         """
         now_time = timezone.localtime(timezone.now()).time()
-        
+
         if self.opening_time <= self.closing_time:
             return self.opening_time <= now_time <= self.closing_time
         else:
@@ -93,19 +119,44 @@ class MerchantProfile(models.Model):
     @property
     def active_subscription(self):
         """
-        Safely retrieves the associated subscription record 
+        Safely retrieves the associated subscription record
         without crashing if the row doesn't exist.
         """
         try:
             return self.vendorsubscription
-        except AttributeError: 
+        except AttributeError:
             return None
+
+    @property
+    def subscription_or_trial_status(self):
+        return evaluate_merchant_subscription_or_trial(self)
+
+    @property
+    def has_active_access(self) -> bool:
+        return self.subscription_or_trial_status.has_access
+
+    @property
+    def is_on_active_trial(self) -> bool:
+        return self.subscription_or_trial_status.is_on_trial
+
+    @property
+    def trial_days_remaining(self) -> int:
+        return self.subscription_or_trial_status.trial_days_remaining
+
+    @property
+    def can_accept_orders(self) -> bool:
+        return bool(
+            self.is_approved
+            and self.is_active_store
+            and self.has_active_access
+            and self.is_currently_open
+        )
 
     def recalculate_ratings(self):
         """Recalculates aggregate star counts and average rating score."""
         reviews = self.reviews.all()
         total_count = reviews.count()
-        
+
         if total_count == 0:
             self.rating = 0.00
             self.review_count = 0
@@ -121,21 +172,25 @@ class MerchantProfile(models.Model):
             self.count_3_stars = reviews.filter(rating=3).count()
             self.count_2_stars = reviews.filter(rating=2).count()
             self.count_1_stars = reviews.filter(rating=1).count()
-            
+
             total_sum = sum(r.rating for r in reviews)
             self.rating = round(total_sum / total_count, 2)
-            
+
         self.save(update_fields=[
-            'rating', 'review_count', 
-            'count_5_stars', 'count_4_stars', 
+            'rating', 'review_count',
+            'count_5_stars', 'count_4_stars',
             'count_3_stars', 'count_2_stars', 'count_1_stars'
         ])
 
     def save(self, *args, **kwargs):
-        # Automatically trigger Paystack subaccount creation upon admin approval
-        if self.is_approved and not self.paystack_subaccount_code:
-            if hasattr(self, 'settlement_account'):
+        if self.is_approved:
+            # Grant 7-day free trial once upon approval if no active subscription/trial exists
+            ensure_merchant_trial_on_approval(self, days=7)
+
+            # Automatically trigger Paystack subaccount creation upon admin approval
+            if not self.paystack_subaccount_code and hasattr(self, 'settlement_account'):
                 self.settlement_account.create_paystack_subaccount()
+
         super().save(*args, **kwargs)
 
     def __str__(self):
