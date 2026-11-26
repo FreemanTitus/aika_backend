@@ -3,7 +3,7 @@ import logging
 from datetime import timedelta
 from decimal import Decimal
 from typing import Optional
-from django.db.models import Value
+from django.db.models import Value, DecimalField
 from django.db.models.functions import Coalesce
 from asgiref.sync import sync_to_async
 from django.db import transaction
@@ -151,7 +151,11 @@ def get_marketplace_vendors_api(
             'storefront_config',
         )
         .annotate(
-            effective_plan_price=Coalesce('vendorsubscription__plan__price', Value(0))
+            effective_plan_price=Coalesce(
+                'vendorsubscription__plan__price',
+                Value(Decimal("0.00")),
+                output_field=DecimalField(max_digits=12, decimal_places=2),
+            )
         )
         .order_by(
             '-effective_plan_price',
@@ -278,7 +282,11 @@ def get_marketplace_products_api(
             "brand",
         )
         .annotate(
-            effective_plan_price=Coalesce("vendor__vendorsubscription__plan__price", Value(0))
+            effective_plan_price=Coalesce(
+                'vendorsubscription__plan__price',
+                Value(Decimal("0.00")),
+                output_field=DecimalField(max_digits=12, decimal_places=2),
+            )
         )
         .order_by("-effective_plan_price", "-vendor__rating", "name")
         .distinct()
