@@ -117,6 +117,34 @@ async def _confirm_and_finalize(order_obj) -> bool:
     return True
 
 
+CATEGORY_LABELS = {
+    "gadgets": "Gadgets & Tech",
+    "apparel": "Clothing & Apparel",
+    "appliances": "Home Appliances",
+    "beauty": "Beauty & Cosmetics",
+    "restaurant": "Restaurant",
+    "general": "General Items",
+}
+
+
+def get_product_category_label(product) -> str:
+    # Pull display labels from MerchantProfile enums when available
+    from merchant.models import MerchantProfile
+
+    labels = dict(CATEGORY_LABELS)
+    for choices_attr in ("EcommerceCategory", "BusinessType"):
+        enum_cls = getattr(MerchantProfile, choices_attr, None)
+        if enum_cls is not None and hasattr(enum_cls, "choices"):
+            for key, label in enum_cls.choices:
+                labels.setdefault(str(key).lower(), str(label))
+
+    raw_cat = (getattr(product, "category", "") or "").strip().lower()
+    if raw_cat in labels:
+        return labels[raw_cat]
+    if getattr(product, "sub_category", None) and product.sub_category.name:
+        return product.sub_category.name
+    return raw_cat.replace("_", " ").title() if raw_cat else "General Items"
+
 # =========================================================================
 # 1. GET ALL VENDORS
 # =========================================================================
@@ -349,7 +377,7 @@ def get_marketplace_products_api(
             "discount_percentage": getattr(product, "discount_percentage", None),
             "image": product.image.url if product.image else None,
             "category": product.category,
-            "category_label": product.get_category_display(),
+            "category_label": get_product_category_label(product),
             "sub_category_name": product.sub_category.name if product.sub_category else None,
             "brand_name": product.brand.name if product.brand else None,
             "vendor": {
@@ -383,8 +411,24 @@ def get_marketplace_products_api(
 # =========================================================================
 # 2. GET VENDOR STOREFRONT DETAILS
 # =========================================================================
+CATEGORY_SLUG_MAP = {
+    "gadgets": "gadgets",
+    "gadgets & tech": "gadgets",
+    "apparel": "apparel",
+    "clothing & apparel": "apparel",
+    "appliances": "appliances",
+    "home appliances": "appliances",
+    "beauty": "beauty",
+    "beauty & cosmetics": "beauty",
+    "restaurant": "restaurant",
+    "restaurants": "restaurant",
+    "general": "general",
+    "general items": "general",
+}
+
+
 def _resolve_product_category(category_param: str | None) -> str | None:
-    """Normalizes a category slug or display label into Product.CategoryChoices value."""
+    """Normalizes a category slug or display label into a canonical category slug."""
     if not category_param:
         return None
 
@@ -392,11 +436,22 @@ def _resolve_product_category(category_param: str | None) -> str | None:
     if not raw_cat or raw_cat in {"ecommerce", "e_commerce", "all"}:
         return None
 
-    display_to_choice = {
-        label.lower(): value
-        for value, label in Product.CategoryChoices.choices
-    }
-    return display_to_choice.get(raw_cat, raw_cat)
+    alias_map = dict(CATEGORY_SLUG_MAP)
+    try:
+        from merchant.models import MerchantProfile
+
+        for enum_name in ("EcommerceCategory", "BusinessType"):
+            enum_cls = getattr(MerchantProfile, enum_name, None)
+            if enum_cls is not None and hasattr(enum_cls, "choices"):
+                for slug, label in enum_cls.choices:
+                    slug_clean = str(slug).strip().lower()
+                    label_clean = str(label).strip().lower()
+                    alias_map[slug_clean] = slug_clean
+                    alias_map[label_clean] = slug_clean
+    except Exception:
+        pass
+
+    return alias_map.get(raw_cat, raw_cat)
 
 
 def filter_ecommerce_vendors_by_category(queryset, category_param: str | None):
@@ -524,7 +579,7 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
                 "bonanza_mode": product.bonanza_mode,
                 "discount_percentage": getattr(product, 'discount_percentage', None),
                 "category": product.category,
-                "category_label": product.get_category_display(),
+                "category_label": get_product_category_label(product),
                 "brand_name": product.brand.name if product.brand else None,
                 "sub_category_name": product.sub_category.name if product.sub_category else None,
             })
@@ -537,13 +592,15 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
             .values_list('category', flat=True)
             .distinct()
         )
-        choice_labels = dict(Product.CategoryChoices.choices)
         for cat_key in cat_query:
-            if cat_key and cat_key not in seen_cat_keys:
-                seen_cat_keys.add(cat_key)
+            normalized_key = str(cat_key or '').strip().lower()
+            if normalized_key and normalized_key not in seen_cat_keys:
+                seen_cat_keys.add(normalized_key)
                 available_categories.append({
-                    "key": cat_key,
-                    "label": choice_labels.get(cat_key, str(cat_key).replace('_', ' ').title()),
+                    "key": normalized_key,
+                    "label": CATEGORY_LABELS.get(
+                        normalized_key, normalized_key.replace('_', ' ').title()
+                    ),
                 })
 
         # Subcategories (e.g. Laptops, Chargers) for product filtering in the storefront
@@ -588,7 +645,7 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
             if product.sub_category and product.sub_category.name:
                 category_name = product.sub_category.name
             elif product.category:
-                category_name = product.get_category_display()
+                category_name = get_product_category_label(product)
             else:
                 category_name = "General Items"
 
@@ -742,14 +799,16 @@ def _sync_get_public_product_worker(product_id, request):
         active_items = ProductItem.objects.filter(product=product, is_active=True).prefetch_related('variant_values')
         
         for item in active_items:
-            # Safely fallback or calculate promotional bonanza updates
             d_price = item.discount_price if item.bonanza_mode and item.discount_price else None
             if not item.bonanza_mode and product.bonanza_mode:
                 d_price = item.current_price
 
+            raw_sku = getattr(item, "sku", None)
+            sku_code = str(raw_sku).strip() if raw_sku else f"{product.id}-SKU-{item.id}"
+
             sku_matrix.append({
                 "id": item.id,
-                "sku": getattr(item, 'sku', f"{product.id}-SKU-{item.id}"),
+                "sku": sku_code,
                 "base_price": item.base_selling_price,
                 "current_price": item.current_price,
                 "discount_price": d_price,

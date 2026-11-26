@@ -63,7 +63,7 @@ class InitialDropdownsResponseSchema(Schema):
 
 class SubCategoryCreateSchema(Schema):
     """Validates fine-grained category niches under primary departments."""
-    primary_category: CategoryLiteral
+    primary_category: Optional[str] = None
     name: str
     slug: str
 
@@ -129,7 +129,7 @@ class ProductSavePayloadSchema(Schema):
     name: str
     description: str
     price: Decimal
-    category: CategoryLiteral
+    category: Optional[str] = None
 
     key_features: Optional[str] = "[]"
     

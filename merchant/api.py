@@ -8,7 +8,7 @@ from django.shortcuts import get_object_or_404
 from django.http import JsonResponse
 from django.db.models import Sum, Count, Q, OuterRef, Exists, Prefetch
 from django.db.models.functions import TruncDate
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from django.core.files.base import ContentFile
 from django.utils.text import slugify
 from asgiref.sync import sync_to_async
@@ -18,7 +18,6 @@ from ninja.files import UploadedFile
 from datetime import datetime
 from django.utils import timezone
 from datetime import timedelta
-
 # Authenticator and Schema imports
 from accounts.models import CoverageArea
 from accounts.utils import JWTAuth, generate_alphanumeric_id
@@ -274,8 +273,49 @@ def list_merchant_inventory_api(request):
 # 3. ADD INVENTORY ITEM (MULTIPART/FORM DATA)
 # =========================================================================
 
+def _to_int_or_none(val):
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        return int(str(val).strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _get_or_create_with_unique_slug(model_cls, lookup_kwargs, base_name, extra_defaults=None):
+    clean_name = base_name.strip()
+    base_slug = slugify(clean_name) or "item"
+    defaults = {
+        "slug": base_slug,
+        **(extra_defaults or {}),
+    }
+    try:
+        obj, _ = model_cls.objects.get_or_create(**lookup_kwargs, defaults=defaults)
+        return obj
+    except IntegrityError:
+        for idx in range(1, 50):
+            candidate_slug = f"{base_slug}-{idx}"
+            try:
+                obj, _ = model_cls.objects.get_or_create(
+                    **lookup_kwargs,
+                    defaults={**defaults, "slug": candidate_slug},
+                )
+                return obj
+            except IntegrityError:
+                continue
+        raise
+
 def _sync_add_product_worker(
-    user, profile, store_type, data, key_features, variant_options, sku_items, gallery_images, request_files, menu_options=None
+    user,
+    profile,
+    store_type,
+    data,
+    key_features,
+    variant_options,
+    sku_items,
+    gallery_images,
+    request_files,
+    menu_options=None,
 ):
     def safe_json_parse(val, default):
         if not val:
@@ -298,114 +338,148 @@ def _sync_add_product_worker(
     def get_file_from_request(files_obj, key):
         if not files_obj:
             return None
-        if hasattr(files_obj, 'get'):
+        if hasattr(files_obj, "get"):
             return files_obj.get(key)
         if isinstance(files_obj, (list, tuple)):
             for f in files_obj:
-                if getattr(f, 'name', None) == key or str(f).endswith(key):
+                if getattr(f, "name", None) == key or str(f).endswith(key):
                     return f
             return files_obj[0] if files_obj else None
         return None
 
     with transaction.atomic():
-        # Derive the correct base category safely
-        if store_type == 'restaurant':
-            resolved_category = 'restaurant'  # or keep 'meals' as broad category, but let subcategories handle specifics
+        # 1. Derive base category from MerchantProfile
+        if store_type == "restaurant" or getattr(profile, "business_type", "") == "restaurant":
+            resolved_category = "restaurant"
         else:
-            resolved_category = str(profile.ecommerce_sub_category).lower().strip() if getattr(profile, 'ecommerce_sub_category', None) else 'general'
+            raw_cat = (
+                getattr(profile, "ecommerce_category", None)
+                or getattr(profile, "ecommerce_sub_category", None)
+                or getattr(data, "category", None)
+                or "general"
+            )
+            resolved_category = str(raw_cat).lower().strip() or "general"
 
-        # 1. Instantiate Core Base Product Model
         product = Product.objects.create(
             id=f"PRD-{generate_alphanumeric_id(8)}",
             vendor=profile,
             name=data.name.strip(),
-            description=data.description.strip(),
+            description=(data.description or "").strip(),
             key_features=key_features,
             price=data.price,
             category=resolved_category,
-            bonanza_mode=data.bonanza_mode,
+            bonanza_mode=bool(data.bonanza_mode),
             discount_price=data.discount_price,
-            is_available=data.is_available
+            is_available=bool(data.is_available),
         )
 
-        primary_file = get_file_from_request(request_files, data.image_key or 'image')
+        dirty_product = False
+
+        primary_file = get_file_from_request(request_files, data.image_key or "image")
         if primary_file:
             product.image = primary_file
-            product.save()
+            dirty_product = True
 
-        # Handle Subcategories (Applies to BOTH Restaurants and E-Commerce)
-        sub_category_selection = str(data.sub_category_id or '').strip()
-        if sub_category_selection == "CUSTOM" and data.new_sub_category_name:
-            sub_cat, _ = SubCategory.objects.get_or_create(
-                name=data.new_sub_category_name.strip(),
-                primary_category=resolved_category,
-                defaults={'slug': slugify(data.new_sub_category_name)}
+        # 2. Subcategories (Restaurants & E-Commerce)
+        sub_category_selection = str(data.sub_category_id or "").strip()
+        if sub_category_selection == "CUSTOM" and (data.new_sub_category_name or "").strip():
+            sub_cat = _get_or_create_with_unique_slug(
+                SubCategory,
+                lookup_kwargs={
+                    "name__iexact": data.new_sub_category_name.strip(),
+                    "primary_category": resolved_category,
+                },
+                base_name=data.new_sub_category_name,
+                extra_defaults={"name": data.new_sub_category_name.strip()},
             )
             product.sub_category = sub_cat
-            product.save()  # <--- Ensure product is saved with custom subcategory
+            dirty_product = True
         elif sub_category_selection.isdigit():
             product.sub_category_id = int(sub_category_selection)
-            product.save()  # <--- Ensure product is saved with selected subcategory ID
+            dirty_product = True
 
-        # Handle Brands (E-Commerce Only)
-        if store_type != 'restaurant':
-            brand_selection = str(data.brand_selection or 'NONE').strip()
-            if brand_selection == "CUSTOM" and data.new_brand_name:
-                brand, _ = Brand.objects.get_or_create(
-                    name=data.new_brand_name.strip(),
-                    defaults={'slug': slugify(data.new_brand_name), 'created_by': user}
+        # 3. Brands (E-Commerce Only)
+        if store_type != "restaurant":
+            brand_selection = str(data.brand_selection or "NONE").strip()
+            if brand_selection == "CUSTOM" and (data.new_brand_name or "").strip():
+                brand = _get_or_create_with_unique_slug(
+                    Brand,
+                    lookup_kwargs={"name__iexact": data.new_brand_name.strip()},
+                    base_name=data.new_brand_name,
+                    extra_defaults={
+                        "name": data.new_brand_name.strip(),
+                        "created_by": user,
+                    },
                 )
                 if product.sub_category:
                     brand.sub_categories.add(product.sub_category)
                 product.brand = brand
+                dirty_product = True
             elif brand_selection.isdigit():
                 product.brand_id = int(brand_selection)
+                dirty_product = True
+
+        if dirty_product:
             product.save()
 
-        # 2. Restaurant Menu Options (Simple portion/pricing tiers)
-        if store_type == 'restaurant' and menu_options:
+        # 4. Restaurant Menu Options
+        if store_type == "restaurant" and menu_options:
             option_rows = []
             for opt_input in menu_options:
-                opt_name = str(opt_input.get('name', '')).strip()
-                opt_price = opt_input.get('price')
+                if not isinstance(opt_input, dict):
+                    continue
+                opt_name = str(opt_input.get("name", "")).strip()
+                opt_price = opt_input.get("price")
                 if opt_name and opt_price is not None:
-                    option_rows.append(MenuItemOption(
-                        product=product,
-                        name=opt_name,
-                        price=Decimal(str(opt_price)),
-                        is_available=bool(opt_input.get('is_available', True))
-                    ))
+                    option_rows.append(
+                        MenuItemOption(
+                            product=product,
+                            name=opt_name,
+                            price=Decimal(str(opt_price)),
+                            is_available=bool(opt_input.get("is_available", True)),
+                        )
+                    )
             if option_rows:
                 MenuItemOption.objects.bulk_create(option_rows)
 
-        # 3. Multi-Step Many-to-Many Variant Synthesis Engine (E-Commerce Only)
-        elif store_type != 'restaurant' and variant_options and sku_items:
+        # 5. Multi-Step Variant & SKU Synthesis (E-Commerce Only)
+        elif store_type != "restaurant" and variant_options and sku_items:
             created_values_map = {}
 
             for opt_input in variant_options:
-                opt_name = str(opt_input.get('name', '')).strip()
+                if not isinstance(opt_input, dict):
+                    continue
+                opt_name = str(opt_input.get("name", "")).strip()
+                if not opt_name:
+                    continue
                 option = VariantOption.objects.create(product=product, name=opt_name)
 
-                value_rows = [
-                    VariantValue(option=option, value=str(val_str).strip())
-                    for val_str in opt_input.get('values', [])
+                raw_values = [
+                    str(val_str).strip()
+                    for val_str in opt_input.get("values", [])
+                    if str(val_str).strip()
                 ]
+                value_rows = [VariantValue(option=option, value=val) for val in raw_values]
                 for val_obj in VariantValue.objects.bulk_create(value_rows):
                     created_values_map[val_obj.value.lower()] = val_obj
 
             sku_rows, sku_value_names = [], []
             for sku_input in sku_items:
-                price_override = sku_input.get('price_override')
-                discount_price = sku_input.get('discount_price')
-                sku_rows.append(ProductItem(
-                    product=product,
-                    stock_qty=max(int(sku_input.get('stock_qty', 0)), 0),
-                    price_override=Decimal(str(price_override)) if price_override else None,
-                    bonanza_mode=bool(sku_input.get('bonanza_mode', False)),
-                    discount_price=Decimal(str(discount_price)) if discount_price else None,
-                    is_active=bool(sku_input.get('is_active', True))
-                ))
-                sku_value_names.append(sku_input.get('value_names', []))
+                if not isinstance(sku_input, dict):
+                    continue
+                price_override = sku_input.get("price_override")
+                discount_price = sku_input.get("discount_price")
+                sku_rows.append(
+                    ProductItem(
+                        product=product,
+                        stock_qty=max(int(sku_input.get("stock_qty", 0)), 0),
+                        price_override=Decimal(str(price_override)) if price_override not in (None, "") else None,
+                        bonanza_mode=bool(sku_input.get("bonanza_mode", False)),
+                        discount_price=Decimal(str(discount_price)) if discount_price not in (None, "") else None,
+                        is_active=bool(sku_input.get("is_active", True)),
+                    )
+                )
+                sku_value_names.append(sku_input.get("value_names", []))
 
             created_skus = ProductItem.objects.bulk_create(sku_rows)
 
@@ -413,30 +487,31 @@ def _sync_add_product_worker(
             link_rows = []
             for item_sku, frontend_value_names in zip(created_skus, sku_value_names):
                 seen = set()
-                for val_name in frontend_value_names:
+                for val_name in frontend_value_names or []:
                     key = str(val_name).lower().strip()
                     val_obj = created_values_map.get(key)
                     if val_obj is not None and val_obj.pk not in seen:
                         seen.add(val_obj.pk)
-                        link_rows.append(through(productitem_id=item_sku.pk, variantvalue_id=val_obj.pk))
+                        link_rows.append(
+                            through(productitem_id=item_sku.pk, variantvalue_id=val_obj.pk)
+                        )
             if link_rows:
                 through.objects.bulk_create(link_rows)
 
-        # 4. Secondary Media Assets Attachment (E-Commerce Only)
-        if store_type != 'restaurant' and gallery_images:
-            gallery_rows = []
+        # 6. Secondary Gallery Media (E-Commerce Only)
+        if store_type != "restaurant" and gallery_images:
             for img_meta in gallery_images:
-                f_key = img_meta.get('file_key')
+                if not isinstance(img_meta, dict):
+                    continue
+                f_key = img_meta.get("file_key")
                 gallery_file = get_file_from_request(request_files, f_key)
                 if f_key and gallery_file:
-                    gallery_rows.append(ProductImage(
+                    ProductImage.objects.create(
                         product=product,
                         image=gallery_file,
-                        caption=str(img_meta.get('caption', "")).strip()
-                    ))
-            if gallery_rows:
-                ProductImage.objects.bulk_create(gallery_rows)
-                    
+                        caption=str(img_meta.get("caption", "")).strip(),
+                    )
+
         return product.id
 
 
@@ -578,9 +653,18 @@ def add_product_api(request, data: Form[ProductSavePayloadSchema]):
 # =========================================================================
 
 def _sync_edit_product_worker(
-    user, profile, product, store_type, data, key_features, variant_options, sku_items, gallery_images, menu_options, request_files
+    user,
+    profile,
+    product,
+    store_type,
+    data,
+    key_features,
+    variant_options,
+    sku_items,
+    gallery_images,
+    menu_options,
+    request_files,
 ):
-    # Robust helper to parse JSON payloads whether passed as list/dict or JSON strings
     def safe_json_parse(val, default):
         if not val:
             return default
@@ -593,7 +677,6 @@ def _sync_edit_product_worker(
                 return default
         return default
 
-    # Ensure all input collections are properly parsed before proceeding
     key_features = safe_json_parse(key_features, [])
     variant_options = safe_json_parse(variant_options, [])
     sku_items = safe_json_parse(sku_items, [])
@@ -603,43 +686,53 @@ def _sync_edit_product_worker(
     def get_file_from_request(files_obj, key):
         if not files_obj:
             return None
-        if hasattr(files_obj, 'get'):
+        if hasattr(files_obj, "get"):
             return files_obj.get(key)
         if isinstance(files_obj, (list, tuple)):
             for f in files_obj:
-                if getattr(f, 'name', None) == key or str(f).endswith(key):
+                if getattr(f, "name", None) == key or str(f).endswith(key):
                     return f
             return files_obj[0] if files_obj else None
         return None
 
     with transaction.atomic():
-        # Derive base category safely
-        if store_type == 'restaurant':
-            resolved_category = 'restaurant'
+        # 1. Derive base category from MerchantProfile
+        if store_type == "restaurant" or getattr(profile, "business_type", "") == "restaurant":
+            resolved_category = "restaurant"
         else:
-            resolved_category = str(profile.ecommerce_sub_category).lower().strip() if profile.ecommerce_sub_category else 'general'
+            raw_cat = (
+                getattr(profile, "ecommerce_category", None)
+                or getattr(profile, "ecommerce_sub_category", None)
+                or getattr(data, "category", None)
+                or "general"
+            )
+            resolved_category = str(raw_cat).lower().strip() or "general"
 
-        # 1. Update primary core settings safely
+        # 2. Update primary core settings
         product.name = data.name.strip()
-        product.description = data.description.strip()
+        product.description = (data.description or "").strip()
         product.key_features = key_features
         product.price = data.price
         product.category = resolved_category
-        product.bonanza_mode = data.bonanza_mode
+        product.bonanza_mode = bool(data.bonanza_mode)
         product.discount_price = data.discount_price
-        product.is_available = data.is_available
+        product.is_available = bool(data.is_available)
 
-        primary_file = get_file_from_request(request_files, data.image_key or 'image')
+        primary_file = get_file_from_request(request_files, data.image_key or "image")
         if primary_file:
             product.image = primary_file
 
-        # Handle Subcategories (Applies to BOTH Restaurants and E-Commerce)
-        sub_category_selection = str(data.sub_category_id or '').strip()
-        if sub_category_selection == "CUSTOM" and data.new_sub_category_name:
-            sub_cat, _ = SubCategory.objects.get_or_create(
-                name=data.new_sub_category_name.strip(),
-                primary_category=resolved_category,
-                defaults={'slug': slugify(data.new_sub_category_name)}
+        # 3. Subcategories (Restaurants & E-Commerce)
+        sub_category_selection = str(data.sub_category_id or "").strip()
+        if sub_category_selection == "CUSTOM" and (data.new_sub_category_name or "").strip():
+            sub_cat = _get_or_create_with_unique_slug(
+                SubCategory,
+                lookup_kwargs={
+                    "name__iexact": data.new_sub_category_name.strip(),
+                    "primary_category": resolved_category,
+                },
+                base_name=data.new_sub_category_name,
+                extra_defaults={"name": data.new_sub_category_name.strip()},
             )
             product.sub_category = sub_cat
         elif sub_category_selection.isdigit():
@@ -647,13 +740,18 @@ def _sync_edit_product_worker(
         else:
             product.sub_category = None
 
-        # Handle Brands (E-Commerce Only)
-        if store_type != 'restaurant':
-            brand_selection = str(data.brand_selection or 'NONE').strip()
-            if brand_selection == "CUSTOM" and data.new_brand_name:
-                brand, _ = Brand.objects.get_or_create(
-                    name=data.new_brand_name.strip(),
-                    defaults={'slug': slugify(data.new_brand_name), 'created_by': user}
+        # 4. Brands (E-Commerce Only)
+        if store_type != "restaurant":
+            brand_selection = str(data.brand_selection or "NONE").strip()
+            if brand_selection == "CUSTOM" and (data.new_brand_name or "").strip():
+                brand = _get_or_create_with_unique_slug(
+                    Brand,
+                    lookup_kwargs={"name__iexact": data.new_brand_name.strip()},
+                    base_name=data.new_brand_name,
+                    extra_defaults={
+                        "name": data.new_brand_name.strip(),
+                        "created_by": user,
+                    },
                 )
                 if product.sub_category:
                     brand.sub_categories.add(product.sub_category)
@@ -665,16 +763,18 @@ def _sync_edit_product_worker(
 
         product.save()
 
-        # 2. Optimized Photo Gallery Preservation (Bulk Database Operations)
+        # 5. Photo Gallery Preservation
         if gallery_images is not None:
             old_images = {img.id: img for img in ProductImage.objects.filter(product=product)}
             preserved_ids = []
             images_to_bulk_update = []
 
             for img_meta in gallery_images:
-                file_key = img_meta.get('file_key')
-                caption_str = str(img_meta.get('caption', "")).strip()
-                existing_id = img_meta.get('id')
+                if not isinstance(img_meta, dict):
+                    continue
+                file_key = img_meta.get("file_key")
+                caption_str = str(img_meta.get("caption", "")).strip()
+                existing_id = _to_int_or_none(img_meta.get("id"))
 
                 gallery_file = get_file_from_request(request_files, file_key) if file_key else None
 
@@ -682,36 +782,38 @@ def _sync_edit_product_worker(
                     new_img = ProductImage.objects.create(
                         product=product,
                         image=gallery_file,
-                        caption=caption_str
+                        caption=caption_str,
                     )
                     preserved_ids.append(new_img.id)
-                elif existing_id and int(existing_id) in old_images:
-                    old_img = old_images[int(existing_id)]
+                elif existing_id and existing_id in old_images:
+                    old_img = old_images[existing_id]
                     old_img.caption = caption_str
                     images_to_bulk_update.append(old_img)
                     preserved_ids.append(old_img.id)
 
             if images_to_bulk_update:
-                ProductImage.objects.bulk_update(images_to_bulk_update, ['caption'])
+                ProductImage.objects.bulk_update(images_to_bulk_update, ["caption"])
 
             ProductImage.objects.filter(product=product).exclude(id__in=preserved_ids).delete()
 
-        # 3. Restaurant Menu Options Synthesis Block (Restaurant Only)
-        if store_type == 'restaurant' and menu_options is not None:
+        # 6. Restaurant Menu Options (Restaurant Only)
+        if store_type == "restaurant" and menu_options is not None:
             existing_options = {opt.id: opt for opt in MenuItemOption.objects.filter(product=product)}
             processed_option_ids = []
 
             for opt_input in menu_options:
-                opt_id = opt_input.get('id')
-                opt_name = str(opt_input.get('name', '')).strip()
-                opt_price = opt_input.get('price')
-                is_available = bool(opt_input.get('is_available', True))
+                if not isinstance(opt_input, dict):
+                    continue
+                opt_id = _to_int_or_none(opt_input.get("id"))
+                opt_name = str(opt_input.get("name", "")).strip()
+                opt_price = opt_input.get("price")
+                is_available = bool(opt_input.get("is_available", True))
 
-                if opt_name and opt_price is not None:
+                if opt_name and opt_price not in (None, ""):
                     parsed_price = Decimal(str(opt_price))
-                    
-                    if opt_id and int(opt_id) in existing_options:
-                        menu_opt = existing_options[int(opt_id)]
+
+                    if opt_id and opt_id in existing_options:
+                        menu_opt = existing_options[opt_id]
                         menu_opt.name = opt_name
                         menu_opt.price = parsed_price
                         menu_opt.is_available = is_available
@@ -722,51 +824,63 @@ def _sync_edit_product_worker(
                             product=product,
                             name=opt_name,
                             price=parsed_price,
-                            is_available=is_available
+                            is_available=is_available,
                         )
                         processed_option_ids.append(menu_opt.id)
 
-            # Remove options that the restaurant owner deleted in the UI
             MenuItemOption.objects.filter(product=product).exclude(id__in=processed_option_ids).delete()
 
-        # 4. Dynamic Variation Matrices Synthesis Block (E-Commerce Only)
-        elif store_type != 'restaurant' and sku_items is not None:
-            if variant_options:
+        # 7. Dynamic Variation & SKU Synthesis (E-Commerce Only)
+        elif store_type != "restaurant" and sku_items is not None:
+            if variant_options is not None:
                 active_option_ids = []
                 for opt_input in variant_options:
-                    opt_name = str(opt_input.get('name', '')).strip()
+                    if not isinstance(opt_input, dict):
+                        continue
+                    opt_name = str(opt_input.get("name", "")).strip()
+                    if not opt_name:
+                        continue
                     option, _ = VariantOption.objects.get_or_create(product=product, name=opt_name)
                     active_option_ids.append(option.id)
-                    
-                    for val_str in opt_input.get('values', []):
-                        VariantValue.objects.get_or_create(option=option, value=str(val_str).strip())
-                
+
+                    active_val_ids = []
+                    for val_str in opt_input.get("values", []):
+                        clean_val = str(val_str).strip()
+                        if not clean_val:
+                            continue
+                        val_obj, _ = VariantValue.objects.get_or_create(option=option, value=clean_val)
+                        active_val_ids.append(val_obj.id)
+
+                    VariantValue.objects.filter(option=option).exclude(id__in=active_val_ids).delete()
+
                 VariantOption.objects.filter(product=product).exclude(id__in=active_option_ids).delete()
 
-            available_values = VariantValue.objects.filter(option__product=product).select_related('option')
+            available_values = VariantValue.objects.filter(option__product=product).select_related("option")
             flat_values_pool = {str(v.value).lower().strip(): v for v in available_values}
 
             existing_items = {item.id: item for item in ProductItem.objects.filter(product=product)}
             processed_item_ids = []
 
             for sku_input in sku_items:
-                sku_id = sku_input.get('id') or sku_input.get('item_id')
-                frontend_value_names = sku_input.get('value_names', [])
+                if not isinstance(sku_input, dict):
+                    continue
+                sku_id = _to_int_or_none(sku_input.get("id") or sku_input.get("item_id"))
+                frontend_value_names = sku_input.get("value_names", [])
 
-                stock_qty = int(sku_input.get('stock_qty') or 0)
-                raw_price = str(sku_input.get('price_override') or '').strip()
+                stock_qty = max(int(sku_input.get("stock_qty") or 0), 0)
+                raw_price = str(sku_input.get("price_override") or "").strip()
                 price_override = Decimal(raw_price) if raw_price else None
-                
-                raw_discount = str(sku_input.get('discount_price') or '').strip()
+
+                raw_discount = str(sku_input.get("discount_price") or "").strip()
                 discount_price = Decimal(raw_discount) if raw_discount else None
 
-                if sku_id and int(sku_id) in existing_items:
-                    item_sku = existing_items[int(sku_id)]
+                if sku_id and sku_id in existing_items:
+                    item_sku = existing_items[sku_id]
                     item_sku.stock_qty = stock_qty
                     item_sku.price_override = price_override
-                    item_sku.bonanza_mode = bool(sku_input.get('bonanza_mode', False))
+                    item_sku.bonanza_mode = bool(sku_input.get("bonanza_mode", False))
                     item_sku.discount_price = discount_price
-                    item_sku.is_active = bool(sku_input.get('is_active', True))
+                    item_sku.is_active = bool(sku_input.get("is_active", True))
                     item_sku.save()
                     processed_item_ids.append(item_sku.id)
                 else:
@@ -774,21 +888,22 @@ def _sync_edit_product_worker(
                         product=product,
                         stock_qty=stock_qty,
                         price_override=price_override,
-                        bonanza_mode=bool(sku_input.get('bonanza_mode', False)),
+                        bonanza_mode=bool(sku_input.get("bonanza_mode", False)),
                         discount_price=discount_price,
-                        is_active=bool(sku_input.get('is_active', True))
+                        is_active=bool(sku_input.get("is_active", True)),
                     )
                     processed_item_ids.append(item_sku.id)
 
-                matched_relations = [
-                    flat_values_pool[str(val_name).lower().strip()]
-                    for val_name in frontend_value_names
-                    if str(val_name).lower().strip() in flat_values_pool
-                ]
+                matched_relations = []
+                seen_val_ids = set()
+                for val_name in frontend_value_names or []:
+                    key = str(val_name).lower().strip()
+                    val_obj = flat_values_pool.get(key)
+                    if val_obj is not None and val_obj.pk not in seen_val_ids:
+                        seen_val_ids.add(val_obj.pk)
+                        matched_relations.append(val_obj)
 
-                if matched_relations:
-                    item_sku.variant_values.set(matched_relations)
-                    item_sku.save()
+                item_sku.variant_values.set(matched_relations)
 
             ProductItem.objects.filter(product=product).exclude(id__in=processed_item_ids).update(is_active=False)
 

@@ -25,6 +25,22 @@ def product_image_upload_path(instance, filename):
     return os.path.join('products', str(instance.vendor.id), filename)
 
 
+def resolve_product_category_from_vendor(vendor) -> str:
+    """Maps a MerchantProfile's business_type / ecommerce_category to a product category slug."""
+    if not vendor:
+        return "general"
+
+    business_type = (getattr(vendor, "business_type", "") or "").strip().lower()
+    if business_type == "restaurant":
+        return "restaurant"
+
+    if business_type in {"e_commerce", "ecommerce"}:
+        ecom_cat = (getattr(vendor, "ecommerce_category", "") or "").strip().lower()
+        allowed_ecom = {"gadgets", "apparel", "appliances", "beauty"}
+        return ecom_cat if ecom_cat in allowed_ecom else "general"
+
+    return "general"
+
 class VariantOption(models.Model):
     """
     Defines the name of the variant category.
@@ -89,14 +105,6 @@ class Product(models.Model):
     Generalized inventory model used by Restaurants (Food/Drinks), 
     Pharmacies (Drugs), and E-Commerce vendors (Clothes, Tech, etc.)
     """
-    class CategoryChoices(models.TextChoices):
-        GADGETS = 'gadgets', 'Gadgets & Tech'
-        APPAREL = 'apparel', 'Clothing & Apparel'
-        HOME_APPLIANCES = 'appliances', 'Home Appliances'
-        BEAUTY = 'beauty', 'Beauty & Cosmetics'
-        RESTAURANT = 'restaurant', 'Restaurant'
-        GENERAL = 'general', 'General Items'
-
     id = models.CharField(primary_key=True, max_length=15, editable=False)
     vendor = models.ForeignKey(
         'merchant.MerchantProfile',  # Ensure string matching for multi-tenant setups
@@ -113,7 +121,7 @@ class Product(models.Model):
     price = models.DecimalField(max_digits=10, decimal_places=2)
     image = models.ImageField(upload_to='product_images/', blank=True, null=True) # Fallback simple path or use yours
     
-    category = models.CharField(max_length=100, choices=CategoryChoices.choices, default=CategoryChoices.GENERAL)
+    category = models.CharField(max_length=100, blank=True, db_index=True)
     sub_category = models.ForeignKey('SubCategory', on_delete=models.SET_NULL, blank=True, null=True, related_name='products')
     brand = models.ForeignKey('Brand', on_delete=models.SET_NULL, blank=True, null=True, related_name='products')
     
@@ -152,6 +160,9 @@ class Product(models.Model):
                 if not Product.objects.filter(id=new_id).exists():
                     self.id = new_id
                     break
+        if not self.category and self.vendor_id:
+            self.category = resolve_product_category_from_vendor(self.vendor)
+
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -287,22 +298,37 @@ class MenuItemOption(models.Model):
     
 class SubCategory(models.Model):
     """
-    Dynamic model to store fine-grained niches mapping back to primary Category tiers.
+    Dynamic model to store fine-grained niches mapping back to primary departments.
     Example: primary_category='gadgets' -> name='Smartphones'
     """
-    # Links directly back to your existing category choice tokens
+
+    PRIMARY_CATEGORY_CHOICES = [
+        *MerchantProfile.EcommerceCategory.choices,
+        ("restaurant", "Restaurant"),
+        ("general", "General Items"),
+    ]
+
     primary_category = models.CharField(
         max_length=50,
-        choices=Product.CategoryChoices.choices,
-        help_text="The parent department this subcategory belongs to."
+        choices=PRIMARY_CATEGORY_CHOICES,
+        default="general",
+        db_index=True,
+        help_text="The parent department this subcategory belongs to.",
     )
-    name = models.CharField(max_length=100, help_text="e.g., Smartphones, Laptops, Burgers, Hoodies")
-    slug = models.SlugField(max_length=100, unique=True, help_text="Used for clean SEO marketplace routing URLs")
+    name = models.CharField(
+        max_length=100,
+        help_text="e.g., Smartphones, Laptops, Burgers, Hoodies",
+    )
+    slug = models.SlugField(
+        max_length=100,
+        unique=True,
+        help_text="Used for clean SEO marketplace routing URLs",
+    )
 
     class Meta:
         verbose_name = "Sub-Category"
         verbose_name_plural = "Sub-Categories"
-        ordering = ['name']
+        ordering = ["name"]
 
     def __str__(self):
         return f"{self.get_primary_category_display()} -> {self.name}"
