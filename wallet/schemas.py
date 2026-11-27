@@ -53,12 +53,25 @@ class PayoutLogResponseSchema(Schema):
     created_at: datetime
     updated_at: datetime
 
+class VendorWalletTransactionSchema(Schema):
+    id: str
+    order_id: int
+    reference: str
+    title: str
+    amount: float
+    status: str  # "pending" | "completed"
+    balance_bucket: str  # "escrow" | "available"
+    status_label: str
+    created_at: Optional[datetime] = None
+
+
 class VendorWalletDashboardSchema(Schema):
     id: int
     available_balance: float = Field(..., description="Money ready for immediate withdrawal.")
     escrow_balance: float = Field(..., description="Money locked until rider successfully delivers.")
     settlement_account: Optional[SettlementAccountViewSchema] = None
     recent_payouts: List[PayoutLogResponseSchema] = []
+    transactions: List[VendorWalletTransactionSchema] = []
     has_transfer_pin: bool = False
     security_hold_until: Optional[datetime] = None
     created_at: datetime

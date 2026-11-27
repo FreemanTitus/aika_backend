@@ -764,13 +764,11 @@ def list_subscription_plans(request):
     """
     API endpoint for platform administrators and merchants to list all available subscription plans.
     """
-
     _require_admin(request.auth)
 
-    user = request.auth
-
-    plans = SubscriptionPlan.objects.all().order_by('price')
+    plans = SubscriptionPlan.objects.all().order_by("price", "id")
     return 200, plans
+
     
 @router.post("/subscription-plans", response={201: SubscriptionPlanOutSchema, 403: dict, 400: dict})
 def admin_create_subscription_plan(request, payload: SubscriptionPlanCreateSchema):
@@ -780,12 +778,10 @@ def admin_create_subscription_plan(request, payload: SubscriptionPlanCreateSchem
     """
     _require_admin(request.auth)
 
-    user = request.auth
-    
-
     try:
         plan = SubscriptionPlan.objects.create(
-            name=payload.name,
+            name=payload.name.strip(),
+            billing_interval=payload.billing_interval,
             price=Decimal(str(payload.price)),
             description=payload.description,
             features_raw=payload.features_raw,
@@ -794,34 +790,38 @@ def admin_create_subscription_plan(request, payload: SubscriptionPlanCreateSchem
             has_priority_dispatch=payload.has_priority_dispatch,
             has_featured_placement=payload.has_featured_placement,
             has_advanced_analytics=payload.has_advanced_analytics,
-            is_available=payload.is_available if payload.is_available is not None else True
+            is_available=payload.is_available if payload.is_available is not None else True,
         )
         return 201, plan
     except Exception as e:
         return 400, {"detail": f"Failed to provision subscription tier: {str(e)}"}
+
 
 @router.put("/subscription-plans/{plan_id}", response={200: SubscriptionPlanOutSchema, 403: dict, 404: dict, 400: dict})
 def admin_update_subscription_plan(request, plan_id: int, payload: SubscriptionPlanUpdateSchema):
     """
     API endpoint for platform administrators to modify existing subscription tier parameters.
     """
-
     _require_admin(request.auth)
-
-    user = request.auth
-    
 
     plan = get_object_or_404(SubscriptionPlan, id=plan_id)
 
     try:
-        for attr, value in payload.dict(exclude_unset=True).items():
-            if attr == 'price' and value is not None:
-                setattr(plan, attr, Decimal(str(value)))
+        updates = payload.dict(exclude_unset=True)
+        for attr, value in updates.items():
+            if attr == "price":
+                if value is not None:
+                    setattr(plan, attr, Decimal(str(value)))
+            elif attr == "billing_interval":
+                if value is not None:
+                    setattr(plan, attr, value)
+            elif attr == "name" and value is not None:
+                setattr(plan, attr, value.strip())
             else:
                 setattr(plan, attr, value)
-        
-        if payload.name:
-            plan.slug = '' 
+
+        if "name" in updates or "billing_interval" in updates:
+            plan.slug = ""
 
         plan.save()
         return 200, plan
@@ -834,8 +834,6 @@ def admin_delete_subscription_plan(request, plan_id: int):
     API endpoint for platform administrators to delete a subscription tier.
     """
     _require_admin(request.auth)
-
-    user = request.auth
     
     plan = get_object_or_404(SubscriptionPlan, id=plan_id)
 
@@ -853,19 +851,27 @@ def list_vendor_subscriptions_audit(request):
     """Audit all vendor subscription statuses across the platform."""
     _require_admin(request.auth)
 
-    subs = VendorSubscription.objects.select_related('vendor_profile__user', 'plan').all()
-    
+    subs = (
+        VendorSubscription.objects.select_related("vendor_profile__user", "plan")
+        .order_by("-subscription_expires_at", "-id")
+    )
+
     result = []
     for sub in subs:
-        vendor_user = sub.vendor_profile.user
+        vendor_profile = getattr(sub, "vendor_profile", None)
+        vendor_user = getattr(vendor_profile, "user", None) if vendor_profile else None
+        plan = getattr(sub, "plan", None)
+
         result.append({
             "id": sub.id,
-            "vendor_name": sub.vendor_profile.company_name,
-            "vendor_email": vendor_user.email,
-            "plan_name": sub.plan.name if sub.plan else None,
-            "plan_price": float(sub.plan.price) if sub.plan else None,
-            "is_active": sub.is_active,
-            "has_valid_access": sub.has_valid_access,
+            "vendor_name": vendor_profile.company_name if vendor_profile else "Unknown Vendor",
+            "vendor_email": getattr(vendor_user, "email", "") or "",
+            "plan_name": plan.name if plan else None,
+            "billing_interval": getattr(plan, "billing_interval", None) if plan else None,
+            "duration_days": getattr(plan, "duration_days", None) if plan else None,
+            "plan_price": float(plan.price) if plan and plan.price is not None else None,
+            "is_active": bool(sub.is_active),
+            "has_valid_access": bool(sub.has_valid_access),
             "subscription_expires_at": sub.subscription_expires_at,
         })
     return result

@@ -40,35 +40,66 @@ class SubscriptionPlan(models.Model):
     """
     Stores platform-wide pricing tiers dynamically managed via the admin panel.
     """
+
+    class BillingInterval(models.TextChoices):
+        MONTHLY = "monthly", "Monthly (30 Days)"
+        QUARTERLY = "quarterly", "Quarterly (90 Days)"
+        SEMI_ANNUAL = "semi_annual", "6 Months (180 Days)"
+        ANNUAL = "annual", "Annually (365 Days)"
+
+    INTERVAL_DAYS = {
+        BillingInterval.MONTHLY: 30,
+        BillingInterval.QUARTERLY: 90,
+        BillingInterval.SEMI_ANNUAL: 180,
+        BillingInterval.ANNUAL: 365,
+    }
+
     name = models.CharField(max_length=100)
-    slug = models.SlugField(max_length=120, unique=True, blank=True, help_text="Unique URL identifier generated from name.")
-    price = models.DecimalField(max_digits=12, decimal_places=2, help_text="Monthly subscription cost in NGN")
+    slug = models.SlugField(
+        max_length=120,
+        unique=True,
+        blank=True,
+        help_text="Unique URL identifier generated from name.",
+    )
+    billing_interval = models.CharField(
+        max_length=20,
+        choices=BillingInterval.choices,
+        default=BillingInterval.MONTHLY,
+        db_index=True,
+        help_text="Billing cycle length for this plan tier.",
+    )
+    price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        help_text="Subscription cost in NGN for the selected billing interval",
+    )
     description = models.TextField(blank=True, null=True)
-    # --- Quantitative Limits ---                                                                                                  
-    max_monthly_orders = models.PositiveIntegerField(                                                                              
-        null=True,                                                                                                                 
-        blank=True,                                                                                                                
-        help_text="Max orders per billing cycle. Leave blank or None for unlimited.",                                              
-    )                                                                                                                              
-    max_products = models.PositiveIntegerField(                                                                                    
-        null=True,                                                                                                                 
-        blank=True,                                                                                                                
-        help_text="Max active catalog products. Leave blank for unlimited.",                                                       
-    )                                                                                                                              
-                                                                                                                                    
-    # --- Feature Perks / Flags ---                                                                                                
-    has_priority_dispatch = models.BooleanField(                                                                                   
-        default=False,                                                                                                             
-        help_text="Riders are prioritized for orders from vendors on this plan.",                                                  
-    )                                                                                                                              
-    has_featured_placement = models.BooleanField(                                                                                  
-        default=False,                                                                                                             
-        help_text="Vendor appears in the 'Featured' / top carousel on search.",                                                    
-    )                                                                                                                              
-    has_advanced_analytics = models.BooleanField(                                                                                  
-        default=False,                                                                                                             
-        help_text="Access to sales forecasting and customer retention reports.",                                                   
-    )              
+
+    # --- Quantitative Limits ---
+    max_monthly_orders = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Max orders per billing cycle. Leave blank or None for unlimited.",
+    )
+    max_products = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Max active catalog products. Leave blank for unlimited.",
+    )
+
+    # --- Feature Perks / Flags ---
+    has_priority_dispatch = models.BooleanField(
+        default=False,
+        help_text="Riders are prioritized for orders from vendors on this plan.",
+    )
+    has_featured_placement = models.BooleanField(
+        default=False,
+        help_text="Vendor appears in the 'Featured' / top carousel on search.",
+    )
+    has_advanced_analytics = models.BooleanField(
+        default=False,
+        help_text="Access to sales forecasting and customer retention reports.",
+    )
     features_raw = models.TextField(
         help_text="Enter features separated by newlines or commas (e.g., Feature 1, Feature 2)"
     )
@@ -76,12 +107,16 @@ class SubscriptionPlan(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"{self.name} - ₦{self.price}"
-    
+        return f"{self.name} ({self.get_billing_interval_display()}) - ₦{self.price}"
+
+    @property
+    def duration_days(self) -> int:
+        return self.INTERVAL_DAYS.get(self.billing_interval, 30)
+
     @property
     def is_unlimited_orders(self):
         return self.max_monthly_orders is None
-    
+
     @property
     def features_list(self):
         """
@@ -89,17 +124,15 @@ class SubscriptionPlan(models.Model):
         """
         if not self.features_raw:
             return []
-        # Splits by newline or comma if present, filtering out blank spaces
-        separator = '\n' if '\n' in self.features_raw else ','
+        separator = "\n" if "\n" in self.features_raw else ","
         return [item.strip() for item in self.features_raw.split(separator) if item.strip()]
-    
+
     def save(self, *args, **kwargs):
         if not self.slug:
-            base_slug = slugify(self.name)
+            base_slug = slugify(f"{self.name}-{self.billing_interval}")
             slug = base_slug
             counter = 1
-            # Collision prevention loop check
-            while SubscriptionPlan.objects.filter(slug=slug).exists():
+            while SubscriptionPlan.objects.filter(slug=slug).exclude(pk=self.pk).exists():
                 slug = f"{base_slug}-{counter}"
                 counter += 1
             self.slug = slug
@@ -125,10 +158,11 @@ class VendorSubscription(models.Model):
 
     @property
     def billing_cycle_starts(self):
-        """Calculates 30 days before the subscription expires as the start date of the current billing cycle."""
+        """Calculates the start of the current billing window using the active plan's duration."""
+        cycle_days = self.plan.duration_days if self.plan else 30
         if self.subscription_expires_at:
-            return self.subscription_expires_at - timezone.timedelta(days=30)
-        return timezone.now() - timedelta(days=30)
+            return self.subscription_expires_at - timedelta(days=cycle_days)
+        return timezone.now() - timedelta(days=cycle_days)
 
     def get_orders_this_cycle_count(self):
         """Calculates the number of marketplace orders placed with the vendor within the current billing cycle."""
@@ -206,18 +240,18 @@ class VendorSubscription(models.Model):
         threshold = max(1, int(self.plan.max_monthly_orders * 0.1))
         return rem <= min(10, threshold)
 
-    def activate_plan(self, plan, days=30):
-        """Activates or renews a subscription plan cleanly."""
+    def activate_plan(self, plan, days=None):
+        """Activates or renews a subscription plan cleanly using its billing interval."""
         now = timezone.now()
+        effective_days = days if days is not None else plan.duration_days
         base_time = (
             self.subscription_expires_at
-            if self.is_active and self.subscription_expires_at and self.subscription_expires_at > now
-            else now
+            if self.is_active and self.subscription_expires_at and self.subscription_expires_at > now else now
         )
         self.plan = plan
         self.is_active = True
-        self.subscription_expires_at = base_time + timedelta(days=days)
-        self.save(update_fields=['plan', 'is_active', 'subscription_expires_at'])
+        self.subscription_expires_at = base_time + timedelta(days=effective_days)
+        self.save(update_fields=["plan", "is_active", "subscription_expires_at"])
 
 
 class SubscriptionReminderLog(models.Model):

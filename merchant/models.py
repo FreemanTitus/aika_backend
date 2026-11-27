@@ -60,6 +60,13 @@ class MerchantProfile(models.Model):
         null=True,
         help_text="If E-commerce is selected, specify the primary operational niche."
     )
+    is_cac_registered = models.BooleanField(default=False)
+    cac_reg_number = models.CharField(
+        max_length=15, 
+        help_text="CAC Number",
+        null=True,
+        blank=True
+    )
     # PAYSTACK SPLIT PAYMENTS
     paystack_subaccount_code = models.CharField(
         max_length=50,

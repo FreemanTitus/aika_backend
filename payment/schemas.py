@@ -1,10 +1,16 @@
 from datetime import datetime
 
 from ninja import Router, Schema
-from typing import Optional, Any, List
+from typing import Optional, Any, List, Literal
+
+
+
+BillingIntervalLiteral = Literal["monthly", "quarterly", "semi_annual", "annual"]
+
 
 class SubscriptionPlanCreateSchema(Schema):
     name: str
+    billing_interval: BillingIntervalLiteral = "monthly"
     price: float
     description: Optional[str] = None
     features_raw: str
@@ -19,6 +25,7 @@ class SubscriptionPlanOut(Schema):
     id: int
     name: str
     slug: str
+    billing_interval: str
     price: float
     description: Optional[str] = None
     max_monthly_orders: Optional[int] = None
@@ -57,6 +64,7 @@ class VendorSubscriptionDetailOut(Schema):
     vendor_name: str
     vendor_email: str
     plan_name: Optional[str] = None
+    billing_interval: Optional[str] = None
     plan_price: Optional[float] = None
     is_active: bool
     has_valid_access: bool

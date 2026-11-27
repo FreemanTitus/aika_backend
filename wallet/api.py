@@ -55,7 +55,6 @@ async def _paystack(client, method, path, **kwargs):
         body = {}
     return r.status_code, body
 
-
 @router.get("/dashboard", response=VendorWalletDashboardSchema)
 async def get_merchant_wallet_details(request):
     _require_business(request.user)

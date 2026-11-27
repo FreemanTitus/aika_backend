@@ -239,5 +239,25 @@ class ShippingPreferenceInput(Schema):
     fulfillment_type: str = Field(..., pattern=r"^(platform|self|hybrid)$")
     allow_nationwide: bool = False
     self_delivery_fee: Decimal = Field(default=Decimal("0.00"), ge=0, le=Decimal("1000000"), decimal_places=2)
+    
 
+class MerchantDashboardTransactionItemSchema(Schema):
+    id: str
+    order_id: str
+    reference: str
+    title: str
+    customer_name: str
+    amount: float
+    status: str          # "pending" | "completed"
+    balance_bucket: str  # "escrow" | "available"
+    status_label: str    # "Pending (In Escrow)" | "Available"
+    created_at: Optional[datetime] = None
+
+
+class MerchantDashboardTransactionsOutSchema(Schema):
+    status: str = "success"
+    escrow_balance: float
+    available_balance: float
+    pending_count: int
+    transactions: List[MerchantDashboardTransactionItemSchema] = []
 

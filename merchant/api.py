@@ -23,7 +23,8 @@ from accounts.models import CoverageArea
 from accounts.utils import JWTAuth, generate_alphanumeric_id
 from .schemas import (BusinessProfileResponse, UpdateBusinessProfileInput, 
     ProductDetailPayloadSchema, ProductDetailPayloadSchema,
-    ActiveOrdersListSchema, CoordinateUpdatePayload, ShippingPreferenceInput
+    ActiveOrdersListSchema, CoordinateUpdatePayload, ShippingPreferenceInput,
+    MerchantDashboardTransactionItemSchema, MerchantDashboardTransactionsOutSchema
 )
 from wallet.models import VendorWallet
 from wallet.schemas import SetTransferPinSchema
@@ -66,6 +67,84 @@ def parse_json_field(value, field_name):
 # =========================================================================
 # 1. MERCHANT ANALYTICS DASHBOARD SUMMARY
 # =========================================================================
+
+async def _fetch_merchant_dashboard_transactions(vendor_profile, limit: int = 20) -> tuple[list[dict], int]:
+    paid_statuses = {
+        "paid",
+        "processing",
+        "out_for_delivery",
+        "delivered",
+        "received",
+        "completed",
+        "settled",
+        "released",
+    }
+    received_statuses = {"received", "completed", "settled", "released"}
+
+    orders_qs = (
+        MarketplaceOrder.objects.filter(vendor=vendor_profile)
+        .select_related("customer__user")
+        .order_by("-created_at")[:limit]
+    )
+
+    tx_list: list[dict] = []
+    pending_count = 0
+
+    async for order in orders_qs:
+        status_val = str(getattr(order, "status", "") or "").strip().lower()
+        is_paid = bool(
+            getattr(order, "is_paid", False)
+            or getattr(order, "paid_at", None)
+            or status_val in paid_statuses
+        )
+        if not is_paid:
+            continue
+
+        is_received = bool(
+            status_val in received_statuses
+            or getattr(order, "is_received", False)
+            or getattr(order, "customer_confirmed_receipt", False)
+            or getattr(order, "received_at", None)
+            or getattr(order, "customer_confirmed_at", None)
+        )
+        if not is_received:
+            pending_count += 1
+
+        raw_amount = (
+            getattr(order, "vendor_payout", None)
+            or getattr(order, "subtotal", None)
+            or getattr(order, "total_price", 0)
+        )
+        amount = float(raw_amount or 0)
+
+        customer_user = getattr(getattr(order, "customer", None), "user", None)
+        customer_name = (
+            f"{getattr(customer_user, 'first_name', '')} {getattr(customer_user, 'last_name', '')}".strip()
+            or getattr(customer_user, "email", None)
+            or "Customer"
+        )
+
+        reference = (
+            getattr(order, "payment_reference", None)
+            or getattr(order, "reference", None)
+            or f"ORD-{order.id}"
+        )
+
+        tx_list.append({
+            "id": f"order-{order.id}",
+            "order_id": str(order.id),
+            "reference": str(reference),
+            "title": f"Order #{order.id}",
+            "customer_name": customer_name,
+            "amount": amount,
+            "status": "completed" if is_received else "pending",
+            "balance_bucket": "available" if is_received else "escrow",
+            "status_label": "Available" if is_received else "Pending (In Escrow)",
+            "created_at": getattr(order, "created_at", None),
+        })
+
+    return tx_list, pending_count
+
 @router.get("/dashboard/summary")
 def get_merchant_dashboard_summary_api(request):
     """
@@ -208,6 +287,34 @@ def get_merchant_dashboard_summary_api(request):
             },
         },
     }
+
+
+@router.get("/dashboard/transactions", response=MerchantDashboardTransactionsOutSchema, auth=JWTAuth())
+async def get_merchant_dashboard_transactions(request, limit: int = 20):
+    """
+    Returns recent paid order transactions for the main merchant dashboard,
+    showing orders awaiting buyer receipt confirmation as 'pending' (in escrow).
+    """
+    user = request.auth
+    if not user or not user.is_authenticated:
+        raise HttpError(403, "Authentication credentials required.")
+
+    vendor = await MerchantProfile.objects.filter(user=user).afirst()
+    if not vendor:
+        raise HttpError(404, "Merchant profile not found.")
+
+    wallet = await VendorWallet.objects.filter(profile=vendor).afirst()
+    safe_limit = max(1, min(limit, 100))
+    transactions, pending_count = await _fetch_merchant_dashboard_transactions(vendor, limit=safe_limit)
+
+    return {
+        "status": "success",
+        "escrow_balance": float(wallet.escrow_balance) if wallet else 0.0,
+        "available_balance": float(wallet.available_balance) if wallet else 0.0,
+        "pending_count": pending_count,
+        "transactions": transactions,
+    }
+
 # =========================================================================
 # 2. INVENTORY LIST VIEW
 # =========================================================================

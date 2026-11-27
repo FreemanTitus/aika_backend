@@ -1,19 +1,21 @@
 import logging
 import math
 import uuid
+from typing import Optional
 from decimal import Decimal, ROUND_HALF_UP
 from ninja.errors import HttpError
 import httpx
 from django.conf import settings
 from django.db import transaction
 from django.db.models import F
-
+from django.core.exceptions import ObjectDoesNotExist
 from accounts.models import CoverageArea
 from customers.models import CustomerWallet, CustomerWalletTransaction
 from logistics.models import LogisticsPricingConfig
 from order.models import Order
 from logistics.services.routing import Coordinate, RoutingService
-
+from merchant.utils import get_vendor_checkout_shipping_options
+from merchant.models import VendorShippingPreference
 from .models import MarketplaceOrder
 
 logger = logging.getLogger(__name__)
@@ -205,35 +207,38 @@ def _resolve_buyer_area(base_location_input, customer_profile):
     # Nothing usable was sent (e.g. free text): use the hub saved on the customer's account.
     return saved_area
 
-
 def decide_fulfillment(vendor, customer_profile, base_location_input):
     """
     Decides who delivers an order. Returns (fulfillment_mode, self_delivery_fee or None).
     Raises ValueError (shown to the customer) when no valid option exists.
 
-      * restaurants                -> always platform riders
-      * no preference row          -> platform riders (legacy behaviour)
-      * 'self'                     -> vendor delivers, at the vendor's own fee
-      * 'hybrid'                   -> same hub: platform riders; other hub: vendor delivers
-      * 'platform'                 -> platform riders; outside the vendor's hub only when
-                                      allow_nationwide is on
+    - restaurants       -> always platform riders
+    - no preference row -> platform riders (legacy behaviour)
+    - 'self'            -> vendor delivers, at the vendor's own fee
+    - 'hybrid'          -> same hub: platform riders; other hub: vendor delivers
+    - 'platform'        -> platform riders; outside the vendor's hub only when
+                           allow_nationwide is on
     """
     Mode = MarketplaceOrder.FulfillmentMode
-    is_restaurant = str(getattr(vendor, 'business_type', '') or '').lower() == 'restaurant'
-    preference = getattr(vendor, 'shipping_preference', None)  # reverse one-to-one: None if missing
+    is_restaurant = str(getattr(vendor, "business_type", "") or "").lower() == "restaurant"
+
+    try:
+        preference = vendor.shipping_preference
+    except (AttributeError, ObjectDoesNotExist):
+        preference = None
 
     if is_restaurant or preference is None:
         return Mode.PLATFORM_DISPATCH, None
 
-    kind = preference.fulfillment_type
-    if kind == 'self':
+    kind = (preference.fulfillment_type or "platform").strip().lower()
+    if kind == "self":
         return Mode.VENDOR_SELF_DELIVERY, Decimal(preference.self_delivery_fee or 0)
 
-    vendor_user = getattr(vendor, 'user', None)
-    vendor_area = getattr(vendor_user, 'base_location', None) if vendor_user else None
+    vendor_user = getattr(vendor, "user", None)
+    vendor_area = getattr(vendor_user, "base_location", None) if vendor_user else None
     buyer_area = _resolve_buyer_area(base_location_input, customer_profile)
 
-    if kind == 'hybrid':
+    if kind == "hybrid":
         if vendor_area is None:
             return Mode.PLATFORM_DISPATCH, None
         if buyer_area is None:
@@ -243,9 +248,12 @@ def decide_fulfillment(vendor, customer_profile, base_location_input):
         return Mode.VENDOR_SELF_DELIVERY, Decimal(preference.self_delivery_fee or 0)
 
     # 'platform'
-    if (not preference.allow_nationwide and vendor_area is not None
-            and buyer_area is not None and vendor_area.id != buyer_area.id):
-        raise ValueError(f"{vendor.company_name} only delivers within {vendor_area.name}.")
+    if not preference.allow_nationwide and vendor_area is not None:
+        if buyer_area is None:
+            raise ValueError(f"Please select your delivery area. {vendor.company_name} only delivers within {vendor_area.name}.")
+        if vendor_area.id != buyer_area.id:
+            raise ValueError(f"{vendor.company_name} only delivers within {vendor_area.name}.")
+
     return Mode.PLATFORM_DISPATCH, None
 
 
@@ -615,3 +623,35 @@ def _parse_idempotency_key(raw_key: str | None) -> uuid.UUID | None:
         return uuid.UUID(str(raw_key).strip())
     except (ValueError, AttributeError):
         raise HttpError(400, "Invalid Idempotency-Key header.")
+
+    
+def resolve_checkout_delivery(
+    vendor,
+    requested_method: Optional[str],
+    platform_delivery_fee: Decimal,
+    same_hub: Optional[bool] = None,
+) -> tuple[str, Decimal]:
+    """
+    Validates the buyer's chosen fulfillment method against the vendor's preference
+    and returns `(resolved_method, final_delivery_fee)`.
+    Raises `ValueError` if the vendor cannot fulfill the order with the requested method.
+    """
+    shipping = get_vendor_checkout_shipping_options(vendor, same_hub=same_hub)
+
+    if not shipping.allowed_methods:
+        raise ValueError(
+            "This vendor does not currently deliver outside their local hub."
+        )
+
+    method = (requested_method or shipping.default_method).strip().lower()
+
+    if method not in shipping.allowed_methods:
+        raise ValueError(
+            f"Delivery method '{method}' is not supported by {vendor.company_name}. "
+            f"Allowed options: {', '.join(shipping.allowed_methods)}."
+        )
+
+    if method == "self":
+        return "self", shipping.self_delivery_fee
+
+    return "platform", Decimal(str(platform_delivery_fee))

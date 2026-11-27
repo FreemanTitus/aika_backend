@@ -6,6 +6,8 @@ from pydantic import EmailStr, field_validator, model_validator
 from decimal import Decimal
 
 
+BillingIntervalLiteral = Literal["monthly", "quarterly", "semi_annual", "annual"]
+
 class DispatchOrderSchema(Schema):
     id: str
     status: str
@@ -215,6 +217,7 @@ class ToggleApprovalSchema(Schema):
 
 class SubscriptionPlanCreateSchema(Schema):
     name: str
+    billing_interval: BillingIntervalLiteral = "monthly"
     price: float
     description: Optional[str] = None
     features_raw: str
@@ -230,6 +233,7 @@ class SubscriptionPlanOutSchema(Schema):
     id: int
     name: str
     slug: str
+    billing_interval: str
     price: float
     description: Optional[str] = None
     max_monthly_orders: Optional[int] = None
@@ -244,6 +248,7 @@ class SubscriptionPlanOutSchema(Schema):
 
 class SubscriptionPlanUpdateSchema(Schema):
     name: Optional[str] = None
+    billing_interval: Optional[BillingIntervalLiteral] = None
     price: Optional[float] = None
     description: Optional[str] = None
     features_raw: Optional[str] = None
