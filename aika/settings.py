@@ -341,8 +341,8 @@ MAILERS = {
         "OPTIONS": {
             "host": config("EMAIL_HOST", default="mail.useaika.ng"),
             "port": config("EMAIL_PORT", default=465, cast=int),
-            "use_tls": False,
-            "use_ssl": True,
+            "use_tls": True,
+            "use_ssl": False,
             "username": config("EMAIL_HOST_USER"),
             "password": config("EMAIL_HOST_PASSWORD"),   # required: never commit it
         },
