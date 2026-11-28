@@ -319,11 +319,25 @@ class LocationCreateInput(Schema):
     area_name: str
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    allows_merchant_registration: bool = False
+    allows_rider_registration: bool = False
+
+class LocationUpdateInput(Schema):
+    name: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    is_active: Optional[bool] = None
+    allows_merchant_registration: Optional[bool] = None
+    allows_rider_registration: Optional[bool] = None
 
 class LocationResponse(Schema):
     id: int
     name: str
     state_name: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    allows_merchant_registration: bool = False
+    allows_rider_registration: bool = False
 
 
 class PlatformSettingCreateSchema(Schema):
@@ -342,5 +356,6 @@ class DeliveryConfigOut(Schema):
 class DeliveryConfigUpdateIn(Schema):
     full_time_rider_earning: Decimal = None
     casual_platform_percentage: Decimal = None
+
 
     

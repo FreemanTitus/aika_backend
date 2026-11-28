@@ -26,7 +26,7 @@ from .schemas import (AdminDashboardResponseSchema,
     SubscriptionPlanOutSchema, AdminProfitResponseSchema, ProductUpdateSchema,
     RiderPayoutAuditOut, AgentListResponseOut, LocationCreateInput, LocationResponse,
     SubscriptionPlanUpdateSchema, PlatformSettingCreateSchema, PlatformSettingOutSchema,
-    DeliveryConfigOut, DeliveryConfigUpdateIn
+    DeliveryConfigOut, DeliveryConfigUpdateIn, LocationUpdateInput
 )
 from order.models import Order
 from merchant.models import MerchantProfile
@@ -1411,27 +1411,99 @@ def create_coverage_area(request, payload: LocationCreateInput):
     state_title = payload.state_name.strip().title()
     area_title = payload.area_name.strip().title()
 
+    if not state_title or not area_title:
+        raise HttpError(400, "State name and coverage area name are required.")
+
     try:
         with transaction.atomic():
             state_obj, _ = State.objects.get_or_create(
                 name__iexact=state_title,
-                defaults={'name': state_title}
+                defaults={"name": state_title, "is_active": True},
             )
-            
+            if not getattr(state_obj, "is_active", True):
+                state_obj.is_active = True
+                state_obj.save(update_fields=["is_active"])
+
             area = CoverageArea(
                 state=state_obj,
                 name=area_title,
                 latitude=payload.latitude,
-                longitude=payload.longitude
+                longitude=payload.longitude,
+                is_active=True,
+                allows_merchant_registration=bool(payload.allows_merchant_registration),
+                allows_rider_registration=bool(payload.allows_rider_registration),
             )
-            area.save() 
+            area.save()
     except IntegrityError:
-        raise HttpError(400, f"The location '{area_title}' in '{state_obj.name}' already exists.")
-    
+        raise HttpError(400, f"The location '{area_title}' in '{state_title}' already exists.")
+
     return 201, {
         "id": area.id,
         "name": area.name,
-        "state_name": area.state.name
+        "state_name": state_obj.name,
+        "latitude": float(area.latitude) if area.latitude is not None else None,
+        "longitude": float(area.longitude) if area.longitude is not None else None,
+        "allows_merchant_registration": bool(getattr(area, "allows_merchant_registration", False)),
+        "allows_rider_registration": bool(getattr(area, "allows_rider_registration", False)),
+    }
+
+@router.patch("/locations/{location_id}", response={200: LocationResponse})
+def update_coverage_area(request, location_id: int, payload: LocationUpdateInput):
+    _require_admin(request.auth)
+
+    area = CoverageArea.objects.select_related("state").filter(id=location_id).first()
+    if not area:
+        raise HttpError(404, "Coverage area not found.")
+
+    update_fields = []
+
+    if payload.name is not None:
+        clean_name = payload.name.strip().title()
+        if not clean_name:
+            raise HttpError(400, "Coverage area name cannot be empty.")
+        if (
+            CoverageArea.objects.filter(state=area.state, name__iexact=clean_name)
+            .exclude(id=area.id)
+            .exists()
+        ):
+            raise HttpError(400, f"The location '{clean_name}' in '{area.state.name}' already exists.")
+        area.name = clean_name
+        update_fields.append("name")
+
+    if payload.latitude is not None:
+        area.latitude = payload.latitude
+        update_fields.append("latitude")
+
+    if payload.longitude is not None:
+        area.longitude = payload.longitude
+        update_fields.append("longitude")
+
+    if payload.is_active is not None:
+        area.is_active = bool(payload.is_active)
+        update_fields.append("is_active")
+
+    if payload.allows_merchant_registration is not None:
+        area.allows_merchant_registration = bool(payload.allows_merchant_registration)
+        update_fields.append("allows_merchant_registration")
+
+    if payload.allows_rider_registration is not None:
+        area.allows_rider_registration = bool(payload.allows_rider_registration)
+        update_fields.append("allows_rider_registration")
+
+    if update_fields:
+        try:
+            area.save(update_fields=update_fields)
+        except IntegrityError:
+            raise HttpError(400, "Unable to update coverage area due to a conflict.")
+
+    return 200, {
+        "id": area.id,
+        "name": area.name,
+        "state_name": area.state.name,
+        "latitude": float(area.latitude) if area.latitude is not None else None,
+        "longitude": float(area.longitude) if area.longitude is not None else None,
+        "allows_merchant_registration": bool(getattr(area, "allows_merchant_registration", False)),
+        "allows_rider_registration": bool(getattr(area, "allows_rider_registration", False)),
     }
 
 @router.get("/platform/referral", response={200: PlatformSettingOutSchema, 403: dict, 500: dict})
