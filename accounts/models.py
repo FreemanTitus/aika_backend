@@ -8,6 +8,7 @@ from geopy.geocoders import Nominatim
 
 class State(models.Model):
     name = models.CharField(max_length=100, unique=True, help_text="e.g., Nasarawa")
+    is_active = models.BooleanField(default=True, help_text="Designates if this state is active.")
     
     def __str__(self):
         return self.name
@@ -19,6 +20,14 @@ class CoverageArea(models.Model):
     latitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
     longitude = models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
     is_active = models.BooleanField(default=True, help_text="Designates if this hub is currently active.")
+    allows_merchant_registration = models.BooleanField(
+        default=False,
+        help_text="Allow new merchants/stores to register in this coverage area."
+    )
+    allows_rider_registration = models.BooleanField(
+        default=False,
+        help_text="Allow new dispatch riders to register in this coverage area."
+    )
 
     class Meta:
         unique_together = ('state', 'name')

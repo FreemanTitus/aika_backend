@@ -453,6 +453,24 @@ def _resolve_product_category(category_param: str | None) -> str | None:
 
     return alias_map.get(raw_cat, raw_cat)
 
+def _resolve_approved_vendor(vendor_identifier: str) -> MerchantProfile:
+    qs = MerchantProfile.objects.select_related('user', 'user__base_location').filter(is_approved=True)
+    vendor = qs.filter(id=vendor_identifier).first()
+    if vendor:
+        return vendor
+
+    q_filter = Q()
+    field_names = {f.name for f in MerchantProfile._meta.get_fields()}
+    for candidate_field in ('vendor_code', 'code', 'store_code', 'slug'):
+        if candidate_field in field_names:
+            q_filter |= Q(**{f"{candidate_field}__iexact": vendor_identifier})
+
+    if q_filter:
+        vendor = qs.filter(q_filter).first()
+        if vendor:
+            return vendor
+
+    raise HttpError(404, "Approved vendor profile not found.")
 
 def filter_ecommerce_vendors_by_category(queryset, category_param: str | None):
     """Filters an e-commerce MerchantProfile queryset to vendors with available products in category."""
@@ -477,9 +495,7 @@ def get_vendor_storefront_api(request, vendor_id: str, filters: StorefrontFilter
     Intelligently branches data structures for E-Commerce and Restaurant clients.
     """
     try:
-        vendor = MerchantProfile.objects.select_related(
-            'user', 'user__base_location'
-        ).get(id=vendor_id, is_approved=True)
+        vendor = _resolve_approved_vendor(vendor_id)
     except MerchantProfile.DoesNotExist:
         raise HttpError(404, "Approved vendor profile not found.")
 

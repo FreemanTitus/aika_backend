@@ -178,13 +178,32 @@ def db_register_individual(data, hashed_password):
 
 
 def db_register_business(data, hashed_password):
-    coverage_area = CoverageArea.objects.filter(id=data.base_location).first()
+    coverage_area = CoverageArea.objects.select_related('state').filter(
+        id=data.base_location
+    ).first()
     if not coverage_area:
         raise HttpError(400, "The selected base location is invalid or no longer exists.")
 
+    if not coverage_area.is_active or not getattr(coverage_area.state, 'is_active', True):
+        raise HttpError(400, "The selected base location is currently inactive.")
+
+    if not getattr(coverage_area, 'allows_merchant_registration', False):
+        raise HttpError(
+            400,
+            f"Store registration is currently only open in Akwanga, Nasarawa. {coverage_area.name} is not open for merchant registration yet."
+        )
+
+    is_cac = bool(getattr(data, "is_cac_registered", False))
+    raw_cac = getattr(data, "cac_reg_number", None)
+    cac_number = (
+        str(raw_cac).strip().upper()[:15] or None
+        if is_cac and raw_cac
+        else None
+    )
+
     # Use add_local_offset=False if you want exact hub coordinates (e.g., 8.910800, 8.406600)
     user_lat, user_lng = _regional_coordinates(coverage_area, add_local_offset=True)
-    
+
     with transaction.atomic():
         user = User.objects.create(
             email=data.email.strip().lower(),
@@ -193,7 +212,7 @@ def db_register_business(data, hashed_password):
             first_name=data.company_name,
             phone_number=data.phone_number,
             street_address=data.street_address or "Vendor Depot",
-            base_location_id=data.base_location,
+            base_location_id=coverage_area.id,
             latitude=user_lat,
             longitude=user_lng,
             is_terms_accepted=True,
@@ -204,6 +223,8 @@ def db_register_business(data, hashed_password):
             company_name=data.company_name,
             business_type=data.business_category,
             ecommerce_sub_category=data.ecommerce_sub_category,
+            is_cac_registered=is_cac,
+            cac_reg_number=cac_number,
         )
         return user.id, profile.id
 
@@ -215,15 +236,25 @@ def db_register_rider(
     id_document_file: Optional[UploadedFile] = None,
 ):
     # Support both CoverageArea integer ID and string hub name
+    base_qs = CoverageArea.objects.select_related('state')
     if isinstance(data.base_location, int) or str(data.base_location).isdigit():
-        coverage_area = CoverageArea.objects.filter(id=int(data.base_location)).first()
+        coverage_area = base_qs.filter(id=int(data.base_location)).first()
     else:
-        coverage_area = CoverageArea.objects.filter(
+        coverage_area = base_qs.filter(
             name__iexact=str(data.base_location).strip()
         ).first()
 
     if not coverage_area:
         raise HttpError(400, "The selected base location is invalid or no longer exists.")
+
+    if not coverage_area.is_active or not getattr(coverage_area.state, 'is_active', True):
+        raise HttpError(400, "The selected base location is currently inactive.")
+
+    if not getattr(coverage_area, 'allows_rider_registration', False):
+        raise HttpError(
+            400,
+            f"Rider registration is currently only open in Akwanga, Nasarawa. {coverage_area.name} is not open for rider registration yet."
+        )
 
     # Use add_local_offset=False if you want exact hub coordinates (e.g., 8.910800, 8.406600)
     user_lat, user_lng = _regional_coordinates(coverage_area, add_local_offset=True)
@@ -331,7 +362,6 @@ def execute_rider_registration(service, data) -> dict:
         )
         raise HttpError(500, "An unexpected error occurred.")
 
-
 def execute_registration(service, data) -> dict:
     hashed_password = validate_registration_password(data)
 
@@ -378,7 +408,6 @@ def execute_registration(service, data) -> dict:
             },
         )
         raise HttpError(500, "An unexpected error occurred.")
-
 
 @router.post("/register/individual", response={201: RegistrationResponse})
 def register_individual_api(request, data: IndividualRegistrationInput):
@@ -634,19 +663,48 @@ def customer_login_api(request, data: UserLoginSchema):
     }
 
 @router.get("/locations", response=List[LocationResponse])
-def get_active_locations(request):
+def get_active_locations(
+    request,
+    for_merchant: bool = False,
+    for_rider: bool = False,
+    role: Optional[str] = None,
+):
     """
-    Returns a list of all active coverage areas and their states.
+    Returns active coverage areas and their states.
+    - Default / role='customer': returns all active locations.
+    - for_merchant=True or role='merchant': only hubs open for merchant registration.
+    - for_rider=True or role='rider': only hubs open for rider registration.
     """
-    areas = CoverageArea.objects.select_related('state').filter(is_active=True)
-    
+    normalized_role = str(role or "").strip().lower()
+    merchant_mode = for_merchant or (normalized_role == "merchant")
+    rider_mode = for_rider or (normalized_role == "rider")
+
+    areas = CoverageArea.objects.select_related('state').filter(
+        is_active=True,
+        state__is_active=True,
+    )
+
+    if merchant_mode and not rider_mode:
+        areas = areas.filter(allows_merchant_registration=True)
+    elif rider_mode and not merchant_mode:
+        areas = areas.filter(allows_rider_registration=True)
+    elif merchant_mode and rider_mode:
+        areas = areas.filter(
+            allows_merchant_registration=True,
+            allows_rider_registration=True,
+        )
+
+    areas = areas.order_by('state__name', 'name')
+
     return [
         {
-            "id": area.id, 
-            "name": area.name, 
+            "id": area.id,
+            "name": area.name,
             "state_name": area.state.name,
             "latitude": float(area.latitude) if area.latitude is not None else None,
             "longitude": float(area.longitude) if area.longitude is not None else None,
+            "allows_merchant_registration": bool(getattr(area, 'allows_merchant_registration', False)),
+            "allows_rider_registration": bool(getattr(area, 'allows_rider_registration', False)),
         }
         for area in areas
     ]

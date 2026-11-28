@@ -73,6 +73,8 @@ class BusinessRegistrationInput(BaseRegistrationInput):
     company_name: str
     business_category: Literal['restaurant', 'e_commerce', 'other']
     ecommerce_sub_category: Optional[Literal['gadgets', 'apparel', 'appliances', 'beauty', 'general']] = None
+    is_cac_registered: bool = False
+    cac_reg_number: Optional[str] = None
     
     @field_validator("company_name", mode="before")
     @classmethod
@@ -91,6 +93,18 @@ class BusinessRegistrationInput(BaseRegistrationInput):
             raise ValueError(
                 "E-commerce businesses require a sub-category."
             )
+
+        if self.is_cac_registered:
+            if not self.cac_reg_number:
+                raise ValueError(
+                    "CAC registration number is required when CAC registered is selected."
+                )
+            if len(self.cac_reg_number) > 15:
+                raise ValueError(
+                    "CAC registration number must not exceed 15 characters."
+                )
+        else:
+            self.cac_reg_number = None
 
         return self
 
@@ -211,3 +225,5 @@ class LocationResponse(Schema):
     state_name: str
     latitude: float | None = None
     longitude: float | None = None
+    allows_merchant_registration: bool = False
+    allows_rider_registration: bool = False
