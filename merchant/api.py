@@ -26,6 +26,7 @@ from .schemas import (BusinessProfileResponse, UpdateBusinessProfileInput,
     ActiveOrdersListSchema, CoordinateUpdatePayload, ShippingPreferenceInput,
     MerchantDashboardTransactionItemSchema, MerchantDashboardTransactionsOutSchema
 )
+from aika_platform.utils import validate_uploaded_image, _pil_image_to_content_file, MAX_IMAGE_BYTES
 from wallet.models import VendorWallet
 from wallet.schemas import SetTransferPinSchema
 # Model imports
@@ -412,6 +413,12 @@ def _get_or_create_with_unique_slug(model_cls, lookup_kwargs, base_name, extra_d
                 continue
         raise
 
+def _sanitize_optional_image(uploaded_file, prefix: str) -> Optional[ContentFile]:
+    if not uploaded_file:
+        return None
+    validated = validate_uploaded_image(uploaded_file)
+    return _pil_image_to_content_file(validated, prefix)
+
 def _sync_add_product_worker(
     user,
     profile,
@@ -443,7 +450,7 @@ def _sync_add_product_worker(
     menu_options = safe_json_parse(menu_options, [])
 
     def get_file_from_request(files_obj, key):
-        if not files_obj:
+        if not files_obj or not key:
             return None
         if hasattr(files_obj, "get"):
             return files_obj.get(key)
@@ -451,8 +458,27 @@ def _sync_add_product_worker(
             for f in files_obj:
                 if getattr(f, "name", None) == key or str(f).endswith(key):
                     return f
-            return files_obj[0] if files_obj else None
         return None
+
+    # Validate & sanitize images before opening DB transaction
+    raw_primary_file = get_file_from_request(request_files, data.image_key or "image")
+    clean_primary_image = _sanitize_optional_image(raw_primary_file, "product_main")
+
+    clean_gallery_items = []
+    if store_type != "restaurant" and gallery_images:
+        for img_meta in gallery_images:
+            if not isinstance(img_meta, dict):
+                continue
+            f_key = img_meta.get("file_key")
+            raw_gallery_file = get_file_from_request(request_files, f_key)
+            clean_gallery_file = _sanitize_optional_image(raw_gallery_file, "product_gallery")
+            if clean_gallery_file:
+                clean_gallery_items.append(
+                    {
+                        "file": clean_gallery_file,
+                        "caption": str(img_meta.get("caption", "")).strip(),
+                    }
+                )
 
     with transaction.atomic():
         # 1. Derive base category from MerchantProfile
@@ -482,9 +508,8 @@ def _sync_add_product_worker(
 
         dirty_product = False
 
-        primary_file = get_file_from_request(request_files, data.image_key or "image")
-        if primary_file:
-            product.image = primary_file
+        if clean_primary_image:
+            product.image = clean_primary_image
             dirty_product = True
 
         # 2. Subcategories (Restaurants & E-Commerce)
@@ -568,7 +593,9 @@ def _sync_add_product_worker(
                 ]
                 value_rows = [VariantValue(option=option, value=val) for val in raw_values]
                 for val_obj in VariantValue.objects.bulk_create(value_rows):
-                    created_values_map[val_obj.value.lower()] = val_obj
+                    val_key = val_obj.value.lower()
+                    created_values_map[(opt_name.lower(), val_key)] = val_obj
+                    created_values_map.setdefault(val_key, val_obj)
 
             sku_rows, sku_value_names = [], []
             for sku_input in sku_items:
@@ -606,18 +633,17 @@ def _sync_add_product_worker(
                 through.objects.bulk_create(link_rows)
 
         # 6. Secondary Gallery Media (E-Commerce Only)
-        if store_type != "restaurant" and gallery_images:
-            for img_meta in gallery_images:
-                if not isinstance(img_meta, dict):
-                    continue
-                f_key = img_meta.get("file_key")
-                gallery_file = get_file_from_request(request_files, f_key)
-                if f_key and gallery_file:
-                    ProductImage.objects.create(
+        if clean_gallery_items:
+            ProductImage.objects.bulk_create(
+                [
+                    ProductImage(
                         product=product,
-                        image=gallery_file,
-                        caption=str(img_meta.get("caption", "")).strip(),
+                        image=item["file"],
+                        caption=item["caption"],
                     )
+                    for item in clean_gallery_items
+                ]
+            )
 
         return product.id
 
@@ -791,7 +817,7 @@ def _sync_edit_product_worker(
     menu_options = safe_json_parse(menu_options, [])
 
     def get_file_from_request(files_obj, key):
-        if not files_obj:
+        if not files_obj or not key:
             return None
         if hasattr(files_obj, "get"):
             return files_obj.get(key)
@@ -799,8 +825,25 @@ def _sync_edit_product_worker(
             for f in files_obj:
                 if getattr(f, "name", None) == key or str(f).endswith(key):
                     return f
-            return files_obj[0] if files_obj else None
         return None
+
+    # Validate & sanitize primary and new gallery images before opening DB transaction
+    raw_primary_file = get_file_from_request(request_files, data.image_key or "image")
+    clean_primary_image = _sanitize_optional_image(raw_primary_file, "product_main")
+
+    sanitized_gallery_uploads = {}
+    if gallery_images:
+        for img_meta in gallery_images:
+            if not isinstance(img_meta, dict):
+                continue
+            file_key = img_meta.get("file_key")
+            if file_key:
+                raw_gallery_file = get_file_from_request(request_files, file_key)
+                if raw_gallery_file:
+                    sanitized_gallery_uploads[file_key] = _sanitize_optional_image(
+                        raw_gallery_file,
+                        "product_gallery",
+                    )
 
     with transaction.atomic():
         # 1. Derive base category from MerchantProfile
@@ -825,9 +868,8 @@ def _sync_edit_product_worker(
         product.discount_price = data.discount_price
         product.is_available = bool(data.is_available)
 
-        primary_file = get_file_from_request(request_files, data.image_key or "image")
-        if primary_file:
-            product.image = primary_file
+        if clean_primary_image:
+            product.image = clean_primary_image
 
         # 3. Subcategories (Restaurants & E-Commerce)
         sub_category_selection = str(data.sub_category_id or "").strip()
@@ -883,7 +925,7 @@ def _sync_edit_product_worker(
                 caption_str = str(img_meta.get("caption", "")).strip()
                 existing_id = _to_int_or_none(img_meta.get("id"))
 
-                gallery_file = get_file_from_request(request_files, file_key) if file_key else None
+                gallery_file = sanitized_gallery_uploads.get(file_key) if file_key else None
 
                 if file_key and gallery_file:
                     new_img = ProductImage.objects.create(

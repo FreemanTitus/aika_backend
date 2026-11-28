@@ -1,5 +1,5 @@
 import math
-import os
+import os, uuid, re
 from django.db import models
 from django.conf import settings
 from customers.models import IndividualProfile
@@ -7,22 +7,56 @@ from merchant.models import MerchantProfile
 from order.models import Order
 from accounts.utils import generate_alphanumeric_id
 import random
+from django.utils.text import slugify
+
+
+ALLOWED_EXTS = {"jpg", "jpeg", "png", "webp"}
+
+
+def _clean_extension(filename: str) -> str:
+    base_name = os.path.basename(filename or "")
+    _, raw_ext = os.path.splitext(base_name)
+    ext = raw_ext.lstrip(".").lower()
+    if ext == "jpeg":
+        ext = "jpg"
+    return ext if ext in ALLOWED_EXTS else "jpg"
+
+
+def _slug_part(value: str, fallback: str = "item", max_len: int = 50) -> str:
+    cleaned = slugify(value or "")
+    cleaned = re.sub(r"-+", "-", cleaned).strip("-")
+    return (cleaned[:max_len] or fallback)
 
 
 def product_gallery_upload_path(instance, filename):
     """
-    Generates a structured, clean path for secondary product gallery images.
-    Example output: product_gallery/wf-prod-123456/filename.jpg
+    Generates a structured path for secondary product gallery images:
+    product_gallery/<product_id>/<product-slug>_<short_uuid>.<ext>
     """
-    return os.path.join('product_gallery', f"wf-prod-{instance.product.id}", filename)
+    ext = _clean_extension(filename)
+    product = getattr(instance, "product", None)
+    product_id = getattr(product, "id", "unknown")
+    product_slug = _slug_part(getattr(product, "name", ""), fallback="gallery")
+    unique_suffix = uuid.uuid4().hex[:8]
+
+    safe_filename = f"{product_slug}_{unique_suffix}.{ext}"
+    return os.path.join("product_gallery", str(product_id), safe_filename)
+
 
 def product_image_upload_path(instance, filename):
     """
-    Organizes uploads dynamically into: media/products/vendor_id/filename
+    Organizes primary product uploads into:
+    products/<vendor_id>/<product-slug>_<product_id>_<short_uuid>.<ext>
     """
-    ext = filename.split('.')[-1]
-    filename = f"{instance.name.slugify() if hasattr(instance.name, 'slugify') else instance.name}_{instance.id}.{ext}"
-    return os.path.join('products', str(instance.vendor.id), filename)
+    ext = _clean_extension(filename)
+    vendor = getattr(instance, "vendor", None)
+    vendor_id = getattr(vendor, "id", "unknown")
+    product_id = getattr(instance, "id", "new")
+    product_slug = _slug_part(getattr(instance, "name", ""), fallback="product")
+    unique_suffix = uuid.uuid4().hex[:8]
+
+    safe_filename = f"{product_slug}_{product_id}_{unique_suffix}.{ext}"
+    return os.path.join("products", str(vendor_id), safe_filename)
 
 
 def resolve_product_category_from_vendor(vendor) -> str:

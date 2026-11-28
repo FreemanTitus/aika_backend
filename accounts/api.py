@@ -1,6 +1,7 @@
 # accounts/api.py
 import json
 import base64
+import binascii
 import uuid
 import random
 import logging
@@ -33,6 +34,7 @@ from .schemas import (
     PasswordResetRequestSchema, PasswordResetConfirmSchema, MessageResponse, PasswordChangeSchema,
     PasswordChangeResponse, LocationResponse
 )
+from aika_platform.utils import validate_uploaded_image, _pil_image_to_content_file, MAX_IMAGE_BYTES
 from django.contrib.auth.password_validation import validate_password
 from django.contrib.auth.hashers import make_password, check_password
 from django.core.exceptions import ValidationError
@@ -76,20 +78,44 @@ def _regional_coordinates(coverage_area, add_local_offset: bool = True):
 
     return lat, lng
 
-def _resolve_image_file(file_obj: Optional[UploadedFile], base64_or_str: Optional[str], prefix: str):
+def _resolve_image_file(
+    file_obj: Optional[UploadedFile],
+    base64_or_str: Optional[str],
+    prefix: str,
+) -> Optional[ContentFile]:
     """
-    Accepts either a multipart UploadedFile or a base64 data URI string
-    and returns a Django-compatible File object (or None).
+    Accepts either a multipart UploadedFile or a base64 image data URI,
+    validates it with `validate_uploaded_image`, and returns a clean ContentFile
+    (or None if nothing was provided).
     """
+    candidate: Optional[UploadedFile] = None
+
     if file_obj is not None:
-        return file_obj
+        candidate = file_obj
+    elif isinstance(base64_or_str, str) and base64_or_str.startswith("data:image/"):
+        if ";base64," not in base64_or_str:
+            raise HttpError(400, f"Malformed base64 image data for {prefix}.")
 
-    if isinstance(base64_or_str, str) and base64_or_str.startswith("data:image/"):
         header, encoded = base64_or_str.split(";base64,", 1)
-        ext = header.split("/")[-1].split("+")[0] or "jpg"
-        return ContentFile(base64.b64decode(encoded), name=f"{prefix}_{uuid.uuid4().hex[:10]}.{ext}")
+        if "svg" in header.lower():
+            raise HttpError(400, f"SVG files are not allowed. Upload a JPG, PNG, or WEBP photo.")
 
-    return None
+        if len(encoded) > (MAX_IMAGE_BYTES * 4 // 3) + 1024:
+            raise HttpError(400, f"Image must not exceed {MAX_IMAGE_BYTES // (1024 * 1024)}MB.")
+
+        try:
+            raw_bytes = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            raise HttpError(400, "The uploaded file is not a valid image even if its extension is .jpg or .png.")
+
+        ext = header.split("/")[-1].split("+")[0].lower() or "jpg"
+        candidate = ContentFile(raw_bytes, name=f"{prefix}.{ext}")
+
+    if candidate is None:
+        return None
+
+    validated_img = validate_uploaded_image(candidate)
+    return _pil_image_to_content_file(validated_img, prefix)
 
 def authenticate_by_email(email, password):
     clean_email = email.strip().lower()
